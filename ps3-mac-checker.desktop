@@ -1,0 +1,10 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=PS3 MAC Checker
+Comment=Read Master & Device MAC from PS3 Controller for ESP32 / Arduino
+Exec=ptyxis -s --title "PS3 Controller MAC Checker" -- /home/warsky/Arduino/check_ps3_mac.sh
+Icon=input-gaming
+Terminal=false
+Categories=Development;
+StartupNotify=true
