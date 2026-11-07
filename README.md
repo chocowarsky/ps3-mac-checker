@@ -61,6 +61,15 @@ Run directly in your terminal:
 python3 ps3_mac_checker.py
 ```
 
+#### Advanced CLI Options
+```bash
+python3 ps3_mac_checker.py --help
+python3 ps3_mac_checker.py -j                    # Machine-readable JSON output
+python3 ps3_mac_checker.py -n -t 5               # Non-interactive with 5-second timeout
+python3 ps3_mac_checker.py --all                 # Enumerate all connected PS3 controllers
+python3 ps3_mac_checker.py --no-sudo             # Disable automatic sudo re-elevation
+```
+
 ### Example Output
 
 ```text
@@ -82,6 +91,17 @@ python3 ps3_mac_checker.py
 ------------------------------------------------------------
 
 Done! Press [Enter] to close terminal...
+```
+
+---
+
+## Testing & Verification
+
+The project includes an automated test battery with 75+ test cases covering hardware edge cases, third-party clone controller anomalies (Gasia/ShanWan/PanHai), udev hotplug races, ioctl encoding, and non-interactive environments:
+
+```bash
+# Run all automated tests (zero dependencies required)
+python3 -m unittest discover -s tests -v
 ```
 
 ---
