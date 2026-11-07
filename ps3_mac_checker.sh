@@ -15,4 +15,8 @@ if [ ! -t 1 ] && [ -z "$PS3_IN_TERMINAL" ]; then
     fi
 fi
 
-python3 "${DIR}/ps3_mac_checker.py"
+if [ -f "${DIR}/ps3_mac_checker.py" ]; then
+    python3 "${DIR}/ps3_mac_checker.py"
+else
+    python3 "${DIR}/check_ps3_mac.py"
+fi
