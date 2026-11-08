@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.8", "3.9", "3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Run unit test battery
+        run: |
+          python3 -m unittest discover -s tests -v
+
+      - name: Test CLI flags & non-interactive execution
+        run: |
+          python3 ps3_mac_checker.py --help
+          python3 ps3_mac_checker.py --version
+          # Expect exit code 1 on headless runner without controller
+          python3 ps3_mac_checker.py -n -t 0.1 || [ $? -eq 1 ]
+          python3 ps3_mac_checker.py -j -t 0.1 || [ $? -eq 1 ]
