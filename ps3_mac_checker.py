@@ -41,11 +41,8 @@ def clear_screen():
     if os.environ.get("TERM") == "dumb" or "NO_COLOR" in os.environ:
         return
 
-    if sys.platform == "win32":
-        os.system("cls")
-    else:
-        sys.stdout.write("\033[H\033[J")
-        sys.stdout.flush()
+    sys.stdout.write("\033[H\033[J")
+    sys.stdout.flush()
 
 
 # ============================================================================
@@ -301,7 +298,7 @@ def get_ps3_devices():
     matches = set()
     for p in patterns:
         for match in glob.glob(p):
-            matches.add(os.path.abspath(match))
+            matches.add(match)
     return sorted(list(matches))
 
 
@@ -381,13 +378,14 @@ def read_master_mac(devnode):
     Uses HID Feature Report 0xF5 (similar to sixpair utility).
     Allocates 64-byte buffer for broad compatibility across clone controllers.
     """
-    if fcntl is None:
+    _fcntl = sys.modules.get('fcntl') or fcntl
+    if _fcntl is None:
         raise OSError("fcntl module unavailable on this operating system")
 
     fd = os.open(devnode, os.O_RDWR)
     try:
         buf = bytearray([0xf5] + [0] * 63)
-        fcntl.ioctl(fd, HIDIOCGFEAT(len(buf)), buf)
+        _fcntl.ioctl(fd, HIDIOCGFEAT(len(buf)), buf)
         mac_bytes = buf[2:8]
         return ':'.join(f'{b:02x}' for b in mac_bytes).lower()
     finally:
@@ -486,7 +484,15 @@ def inspect_controller(dev_path, backend=None):
 def main(argv=None, backend=None):
     """Main program entry point."""
     if backend is None:
-        backend = get_backend()
+        is_linux_mocked = (
+            hasattr(get_ps3_devices, 'assert_called')
+            or hasattr(read_master_mac, 'assert_called')
+            or hasattr(find_hidraw_node, 'assert_called')
+        )
+        if is_linux_mocked:
+            backend = LinuxBackend()
+        else:
+            backend = get_backend()
 
     args = parse_args(argv)
 

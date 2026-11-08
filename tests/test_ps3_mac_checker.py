@@ -20,6 +20,18 @@ if REPO_ROOT not in sys.path:
 
 import ps3_mac_checker
 
+# Cross-platform compatibility stubs for Windows test runners
+if 'fcntl' not in sys.modules:
+    import types
+    _dummy_fcntl = types.ModuleType('fcntl')
+    _dummy_fcntl.ioctl = lambda *args, **kwargs: 0  # type: ignore
+    sys.modules['fcntl'] = _dummy_fcntl
+    ps3_mac_checker.fcntl = _dummy_fcntl
+
+if not hasattr(os, 'geteuid'):
+    os.geteuid = lambda: 1000  # type: ignore
+
+
 
 # ============================================================================
 # CATEGORY 1: IOCTL Encoding & Feature Report Sizing
