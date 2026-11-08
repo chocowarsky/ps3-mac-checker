@@ -1,5 +1,9 @@
 # PS3 Controller MAC Address Checker
 
+[![CI](https://github.com/chocowarsky/ps3-mac-checker/actions/workflows/ci.yml/badge.svg)](https://github.com/chocowarsky/ps3-mac-checker/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/chocowarsky/ps3-mac-checker)](https://github.com/chocowarsky/ps3-mac-checker/releases/latest)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+
 A lightweight, zero-dependency Linux tool to extract both the **Master MAC address** and **Device MAC address** from Sony PlayStation 3 (DualShock 3 / Sixaxis) controllers over USB.
 
 Designed specifically for makers building robotics, RC cars, and IoT projects using **ESP32** and the [`ESP32-PS3`](https://github.com/jvpernis/esp32-ps3) Arduino library.
