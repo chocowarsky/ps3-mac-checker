@@ -4,7 +4,7 @@
 [![Release](https://img.shields.io/github/v/release/chocowarsky/ps3-mac-checker)](https://github.com/chocowarsky/ps3-mac-checker/releases/latest)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-A lightweight, zero-dependency Linux tool to extract both the **Master MAC address** and **Device MAC address** from Sony PlayStation 3 (DualShock 3 / Sixaxis) controllers over USB.
+A lightweight, zero-dependency cross-platform tool (Linux & Windows) to extract both the **Master MAC address** and **Device MAC address** from Sony PlayStation 3 (DualShock 3 / Sixaxis) controllers over USB.
 
 Designed specifically for makers building robotics, RC cars, and IoT projects using **ESP32** and the [`ESP32-PS3`](https://github.com/jvpernis/esp32-ps3) Arduino library.
 
@@ -26,18 +26,19 @@ This tool extracts both addresses and formats the exact line ready to copy into 
 
 ## Features
 
-- **No compilation needed:** Written in clean, pure Python 3 using standard library modules (`fcntl`, `glob`, `os`).
+- **Cross-Platform (Linux & Windows):** Runs seamlessly on Ubuntu / Debian / Fedora / Arch Linux and Windows 10 / 11.
+- **Zero external dependencies:** Pure Python standard library only (`ctypes`, `fcntl`, `glob`, `os`, `sys`). No `pip install` required.
 - **Live connection polling:** If the controller is not plugged in yet, the script waits until you connect the mini-USB cable.
-- **Double-click desktop launcher:** Includes an XDG `.desktop` launcher with terminal auto-spawn for GNOME / Ubuntu.
+- **Double-click desktop launcher:** Includes an XDG `.desktop` launcher with terminal auto-spawn for Linux (Ubuntu / GNOME) and `ps3_mac_checker.bat` for Windows.
 - **Terminal stays open:** Prompts before exit so you have plenty of time to copy the MAC address.
-- **Non-root udev rule:** Includes a udev rule so you don't have to enter a `sudo` password every time.
+- **Non-root / Standard user:** Includes a Linux udev rule; on Windows uses standard user-mode Win32 HID APIs (no Administrator elevation needed).
 
 ---
 
-## Installation
+## Installation & Quickstart
 
+### On Linux (Ubuntu / Debian / Fedora / Arch)
 Clone the repository and run the installer:
-
 ```bash
 git clone https://github.com/chocowarsky/ps3-mac-checker.git
 cd ps3-mac-checker
@@ -45,24 +46,36 @@ chmod +x install.sh
 ./install.sh
 ```
 
-The installer will:
-1. Place `/etc/udev/rules.d/99-ps3-controller.rules` and reload udev.
-2. Install the desktop launcher into `~/.local/share/applications/` and `~/Arduino/`.
+### On Windows (10 / 11)
+1. Install Python 3.10+ from [python.org](https://www.python.org/) (make sure to check **"Add Python to PATH"**).
+2. Clone or download the repository:
+   ```cmd
+   git clone https://github.com/chocowarsky/ps3-mac-checker.git
+   cd ps3-mac-checker
+   ```
+3. Connect your PS3 controller via mini-USB.
+4. Double-click **`ps3_mac_checker.bat`** in File Explorer (or run `python ps3_mac_checker.py` in Command Prompt / PowerShell).
 
 ---
 
 ## Usage
 
 ### 1. GUI / Desktop Launcher
-- Open the application menu (press `Super`) and search for **PS3 MAC Checker**.
-- Or open your file manager, navigate to `~/Arduino`, and double-click **Check_PS3_MAC.desktop**.
+- **Linux:** Open application menu (press `Super`) and search for **PS3 MAC Checker**, or double-click `Check_PS3_MAC.desktop` in `~/Arduino`.
+- **Windows:** Double-click **`ps3_mac_checker.bat`** in the project folder.
 
 ### 2. Command Line
 Run directly in your terminal:
 ```bash
+# On Linux:
 ./ps3_mac_checker.sh
-# or
+# or:
 python3 ps3_mac_checker.py
+
+# On Windows:
+ps3_mac_checker.bat
+# or:
+python ps3_mac_checker.py
 ```
 
 #### Advanced CLI Options
@@ -112,9 +125,8 @@ python3 -m unittest discover -s tests -v
 
 ## Technical Details
 
-Linux exposes HID devices via `/dev/hidraw*`. DualShock 3 controllers support specific HID feature reports:
-- **Feature Report `0xF5` (Master bdaddr):** The controller returns an 8-byte structure containing the 6-byte Bluetooth address of the master host starting at offset 2.
-- **Sysfs `uevent` / `HID_UNIQ`:** The Linux `hid-sony` kernel driver reads and reports the controller's physical Bluetooth device address.
+- **Linux:** Exposes HID devices via `/dev/hidraw*`. Uses `ioctl(fd, HIDIOCGFEAT, buf)` with Feature Report `0xF5` (Master bdaddr) and reads `HID_UNIQ` from sysfs `uevent` (Device bdaddr).
+- **Windows:** Uses Win32 Device Management APIs via `setupapi.dll` (`SetupDiGetClassDevsW` for HID class GUID) to find `VID_054C&PID_0268` interfaces. Opens the interface via `kernel32.dll` (`CreateFileW`) and reads Feature Report `0xF5` (Master bdaddr) and Feature Report `0xF2` (Device bdaddr) via `hid.dll` (`HidD_GetFeature`). No external drivers (e.g. Zadig/ScpToolkit) required.
 
 ---
 

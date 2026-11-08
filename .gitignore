@@ -5,3 +5,4 @@ __pycache__/
 .idea/
 *.bak*
 .DS_Store
+.hermes/
