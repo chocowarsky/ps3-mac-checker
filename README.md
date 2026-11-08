@@ -1,6 +1,5 @@
 # PS3 Controller MAC Address Checker
 
-[![CI](https://github.com/chocowarsky/ps3-mac-checker/actions/workflows/ci.yml/badge.svg)](https://github.com/chocowarsky/ps3-mac-checker/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/chocowarsky/ps3-mac-checker)](https://github.com/chocowarsky/ps3-mac-checker/releases/latest)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
@@ -108,17 +107,6 @@ python3 ps3_mac_checker.py --no-sudo             # Disable automatic sudo re-ele
 ------------------------------------------------------------
 
 Done! Press [Enter] to close terminal...
-```
-
----
-
-## Testing & Verification
-
-The project includes an automated test battery with 75+ test cases covering hardware edge cases, third-party clone controller anomalies (Gasia/ShanWan/PanHai), udev hotplug races, ioctl encoding, and non-interactive environments:
-
-```bash
-# Run all automated tests (zero dependencies required)
-python3 -m unittest discover -s tests -v
 ```
 
 ---
