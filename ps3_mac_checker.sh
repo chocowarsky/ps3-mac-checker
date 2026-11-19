@@ -4,7 +4,7 @@ set -e
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
 
 # If executed outside a terminal (e.g. double-clicked from file manager):
-if [ ! -t 1 ] && [ -z "$PS3_IN_TERMINAL" ]; then
+if [[ ! -t 1 && -z "${PS3_IN_TERMINAL:-}" ]]; then
     export PS3_IN_TERMINAL=1
     if command -v ptyxis >/dev/null 2>&1; then
         exec ptyxis -s --title "PS3 Controller MAC Checker" -- "$0" "$@"
@@ -15,7 +15,7 @@ if [ ! -t 1 ] && [ -z "$PS3_IN_TERMINAL" ]; then
     fi
 fi
 
-if [ -f "${DIR}/ps3_mac_checker.py" ]; then
+if [[ -f "${DIR}/ps3_mac_checker.py" ]]; then
     python3 "${DIR}/ps3_mac_checker.py"
 else
     python3 "${DIR}/check_ps3_mac.py"

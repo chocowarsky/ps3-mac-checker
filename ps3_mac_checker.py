@@ -545,7 +545,12 @@ def main(argv=None, backend=None):
         and not args.json
     ):
         print("\n[*] Administrator privileges (sudo) required to read controller memory...")
-        args_list = ['sudo', sys.executable] + sys.argv
+        script_path = os.path.abspath(__file__)
+        args_list = ['sudo', '--', sys.executable, script_path, '--no-sudo']
+        if args.non_interactive:
+            args_list.append('--non-interactive')
+        if args.all:
+            args_list.append('--all')
         try:
             os.execvp('sudo', args_list)
         except Exception as e:

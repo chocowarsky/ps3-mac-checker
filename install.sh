@@ -23,7 +23,7 @@ sed -e "s|/home/warsky/Arduino/check_ps3_mac.sh|${DIR}/ps3_mac_checker.sh|g" \
 chmod +x "$HOME/.local/share/applications/ps3-mac-checker.desktop"
 
 # Also install to ~/Arduino if folder exists
-if [ -d "$HOME/Arduino" ]; then
+if [[ -d "$HOME/Arduino" ]]; then
     echo "[*] Adding shortcut to ~/Arduino..."
     cp -p "$HOME/.local/share/applications/ps3-mac-checker.desktop" "$HOME/Arduino/Check_PS3_MAC.desktop"
     gio set -t string "$HOME/Arduino/Check_PS3_MAC.desktop" metadata::trusted true 2>/dev/null || true
