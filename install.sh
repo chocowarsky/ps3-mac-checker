@@ -31,7 +31,7 @@ else
     elif command -v curl >/dev/null 2>&1 && command -v tar >/dev/null 2>&1; then
         TMP_DIR="$(mktemp -d)"
         trap 'rm -rf "${TMP_DIR}"' EXIT
-        curl -fsSL "${ARCHIVE_URL}" -o "${TMP_DIR}/repo.tar.gz"
+        curl --proto "=https" --tlsv1.2 -fsSL "${ARCHIVE_URL}" -o "${TMP_DIR}/repo.tar.gz"
         tar -xzf "${TMP_DIR}/repo.tar.gz" -C "${TMP_DIR}"
         rm -rf "${INSTALL_DIR}"
         mv "${TMP_DIR}"/ps3-mac-manager-* "${INSTALL_DIR}"
