@@ -7,16 +7,18 @@ DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
 if [[ ! -t 1 && -z "${PS3_IN_TERMINAL:-}" ]]; then
     export PS3_IN_TERMINAL=1
     if command -v ptyxis >/dev/null 2>&1; then
-        exec ptyxis -s --title "PS3 Controller MAC Checker" -- "$0" "$@"
+        exec ptyxis -s --title "PS3 Controller MAC Manager" -- "$0" "$@"
     elif command -v gnome-terminal >/dev/null 2>&1; then
-        exec gnome-terminal --title "PS3 Controller MAC Checker" -- "$0" "$@"
+        exec gnome-terminal --title "PS3 Controller MAC Manager" -- "$0" "$@"
     elif command -v x-terminal-emulator >/dev/null 2>&1; then
         exec x-terminal-emulator -e "$0" "$@"
     fi
 fi
 
-if [[ -f "${DIR}/ps3_mac_checker.py" ]]; then
-    python3 "${DIR}/ps3_mac_checker.py"
+if [[ -f "${DIR}/ps3_mac_manager.py" ]]; then
+    python3 "${DIR}/ps3_mac_manager.py" "$@"
+elif [[ -f "${DIR}/ps3_mac_checker.py" ]]; then
+    python3 "${DIR}/ps3_mac_checker.py" "$@"
 else
-    python3 "${DIR}/check_ps3_mac.py"
+    python3 "${DIR}/check_ps3_mac.py" "$@"
 fi

@@ -1,6 +1,6 @@
 @echo off
 setlocal
-title PS3 Controller MAC Address Checker
+title PS3 Controller MAC Address Manager
 
 :: Check if Python is available in PATH
 where python >nul 2>nul
@@ -20,7 +20,7 @@ if %ERRORLEVEL% EQU 0 (
     )
 )
 
-"%PY_CMD%" "%~dp0ps3_mac_checker.py" %*
+"%PY_CMD%" "%~dp0ps3_mac_manager.py" %*
 set "EXIT_CODE=%ERRORLEVEL%"
 
 if %EXIT_CODE% NEQ 0 (

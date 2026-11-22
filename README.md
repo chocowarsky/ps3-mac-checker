@@ -1,120 +1,144 @@
-# PS3 Controller MAC Address Checker
+# PS3 Controller MAC Address Manager
 
-[![Release](https://img.shields.io/github/v/release/chocowarsky/ps3-mac-checker)](https://github.com/chocowarsky/ps3-mac-checker/releases/latest)
+[![Release](https://img.shields.io/github/v/release/chocowarsky/ps3-mac-manager)](https://github.com/chocowarsky/ps3-mac-manager/releases/latest)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-A lightweight, zero-dependency cross-platform tool (Linux & Windows) to extract both the **Master MAC address** and **Device MAC address** from Sony PlayStation 3 (DualShock 3 / Sixaxis) controllers over USB.
+A lightweight, zero-dependency cross-platform tool (Linux & Windows) to **read, change, pair, clone, back up, and manage** both the **Master MAC address** and **Device MAC address** on Sony PlayStation 3 (DualShock 3 / Sixaxis) controllers over USB.
 
-Designed specifically for makers building robotics, RC cars, and IoT projects using **ESP32** and the [`ESP32-PS3`](https://github.com/jvpernis/esp32-ps3) Arduino library.
+Built for **ESP32 / Arduino** makers using [`esp32-ps3`](https://github.com/jvpernis/esp32-ps3) / `Ps3Controller.h`, robotics teams swapping spare controllers without reflashing ESP32 firmware, and Linux/Windows users pairing PS3 controllers via Bluetooth (`sixpair` replacement).
 
 ---
 
-## Why Two MAC Addresses?
+## Why Manage the Master MAC?
 
-When connecting a PS3 controller wirelessly to an ESP32, many users run into connection failures because PS3 controllers store two different MAC addresses:
+PS3 controllers store two Bluetooth MAC addresses:
 
-1. **Master MAC (Host Address):** The Bluetooth address of the console/host the controller was paired to. When you press the circular **PS button**, the controller actively searches for this master address. To connect, your ESP32 must mimic this address using:
-   ```cpp
-   Ps3.begin("00:1d:0d:4c:e3:78"); // Put the Master MAC here!
-   ```
-2. **Device MAC (Controller Address):** The controller's own physical Bluetooth MAC address. Putting this address in `Ps3.begin()` will **not** work because the controller does not listen for incoming connections.
+1. **Master MAC (Host Address):** The Bluetooth address the controller actively searches for when you press the **PS button**.
+   - **Check mode:** Extract the controller's existing Master MAC to paste into `Ps3.begin("00:1d:0d:4c:e3:78");`.
+   - **Write / Manage mode (New in v2.0.0):** Reprogram the controller's Master MAC over USB to match your **ESP32**, your **PC's Bluetooth adapter**, a **saved robot profile**, or a **newly generated unicast MAC**.
+2. **Device MAC (Controller Address):** The controller's own physical Bluetooth MAC address (read via sysfs / Feature Report `0xF2`).
 
-This tool extracts both addresses and formats the exact line ready to copy into your Arduino sketch.
+### Real-World Example: Swapping Spare Controllers Without Reflashing
+Suppose your robot's ESP32 already runs `Ps3.begin("00:1d:0d:4c:e3:78");`, and your primary DualShock 3 battery dies mid-match:
+1. Plug in any spare PS3 controller via mini-USB.
+2. Run `python3 ps3_mac_manager.py -s 00:1d:0d:4c:e3:78` (or `--apply-profile robot1`).
+3. Unplug and press the **PS button** — it connects directly to your ESP32 without touching Arduino code.
 
 ---
 
 ## Features
 
-- **Cross-Platform (Linux & Windows):** Runs seamlessly on Ubuntu / Debian / Fedora / Arch Linux and Windows 10 / 11.
-- **Zero external dependencies:** Pure Python standard library only (`ctypes`, `fcntl`, `glob`, `os`, `sys`). No `pip install` required.
-- **Live connection polling:** If the controller is not plugged in yet, the script waits until you connect the mini-USB cable.
-- **Double-click desktop launcher:** Includes an XDG `.desktop` launcher with terminal auto-spawn for Linux (Ubuntu / GNOME) and `ps3_mac_checker.bat` for Windows.
-- **Terminal stays open:** Prompts before exit so you have plenty of time to copy the MAC address.
-- **Non-root / Standard user:** Includes a Linux udev rule; on Windows uses standard user-mode Win32 HID APIs (no Administrator elevation needed).
+- **Read & Write Master MAC (with Read-Back Verification):** Reads Feature Report `0xF5` and writes new Master MAC addresses via `HIDIOCSFEATURE` (Linux) / `HidD_SetFeature` (Windows), then immediately reads back to confirm EEPROM persistence.
+- **Interactive TUI Dashboard:** Launch with no flags to inspect connected controllers, view copy-paste `Ps3.begin(...)` + C array snippets, change MACs, apply profiles, pair to host Bluetooth, or restore backups.
+- **One-Click Host Bluetooth Pairing (`--pair-host`):** Automatically detects local Bluetooth adapters (`/sys/class/bluetooth/hci*` on Linux, `bthprops.cpl` on Windows) and pairs the controller directly (`sixpair` replacement).
+- **Named Profiles (`--save-profile` / `--apply-profile`):** Save robot/controller MAC presets in `~/.config/ps3-mac-manager/config.json` (or `%APPDATA%\ps3-mac-manager\config.json` on Windows) for instant switching.
+- **Automatic Backup & Restore (`--restore` / `--backup`):** Automatically backs up the controller's previous Master MAC before every write, and supports standalone JSON backup export/restore.
+- **Safe Random MAC Generator (`--generate-mac`):** Generates locally administered unicast MAC addresses (never multicast, all-zeros, or `ff:ff:ff:ff:ff:ff`).
+- **Multi-Controller Cloning (`--clone`):** Copy Controller #1's Master MAC across multiple plugged-in controllers.
+- **Zero External Dependencies:** Pure Python standard library only (`argparse`, `ctypes`, `fcntl`, `glob`, `json`, `os`, `sys`). No `pip install` or Zadig drivers required.
+- **Clone Controller Resilience:** Supports both 8-byte canonical and 64-byte padded HID feature reports, plus validation warnings for unprogrammed clone EEPROMs.
 
 ---
 
 ## Installation & Quickstart
 
 ### On Linux (Ubuntu / Debian / Fedora / Arch)
-Clone the repository and run the installer:
 ```bash
-git clone https://github.com/chocowarsky/ps3-mac-checker.git
-cd ps3-mac-checker
+git clone https://github.com/chocowarsky/ps3-mac-manager.git
+cd ps3-mac-manager
 chmod +x install.sh
 ./install.sh
 ```
 
 ### On Windows (10 / 11)
-1. Install Python 3.10+ from [python.org](https://www.python.org/) (make sure to check **"Add Python to PATH"**).
+1. Install Python 3.10+ from [python.org](https://www.python.org/) (check **"Add Python to PATH"**).
 2. Clone or download the repository:
    ```cmd
-   git clone https://github.com/chocowarsky/ps3-mac-checker.git
-   cd ps3-mac-checker
+   git clone https://github.com/chocowarsky/ps3-mac-manager.git
+   cd ps3-mac-manager
    ```
 3. Connect your PS3 controller via mini-USB.
-4. Double-click **`ps3_mac_checker.bat`** in File Explorer (or run `python ps3_mac_checker.py` in Command Prompt / PowerShell).
+4. Double-click **`ps3_mac_manager.bat`** (or run `python ps3_mac_manager.py` in Command Prompt / PowerShell).
 
 ---
 
 ## Usage
 
-### 1. GUI / Desktop Launcher
-- **Linux:** Open application menu (press `Super`) and search for **PS3 MAC Checker**, or double-click `Check_PS3_MAC.desktop` in `~/Arduino`.
-- **Windows:** Double-click **`ps3_mac_checker.bat`** in the project folder.
+### 1. Interactive TUI / Desktop Launcher
+- **Linux:** Launch **PS3 MAC Manager** from your application menu (`Super`), run `./ps3_mac_manager.sh`, or double-click `PS3_MAC_Manager.desktop` in `~/Arduino`.
+- **Windows:** Double-click **`ps3_mac_manager.bat`**.
 
-### 2. Command Line
-Run directly in your terminal:
+### 2. Command Line Reference
 ```bash
-# On Linux:
-./ps3_mac_checker.sh
-# or:
-python3 ps3_mac_checker.py
+# Interactive management dashboard
+python3 ps3_mac_manager.py
 
-# On Windows:
-ps3_mac_checker.bat
-# or:
-python ps3_mac_checker.py
+# Read-only check (legacy ps3-mac-checker behavior)
+python3 ps3_mac_manager.py --check
+python3 ps3_mac_manager.py -j -n -t 5               # Non-interactive JSON output
+
+# Change Master MAC (accepts aa:bb:cc:dd:ee:ff, aa-bb-cc-dd-ee-ff, aabb.ccdd.eeff, or raw hex)
+python3 ps3_mac_manager.py -s 00:1d:0d:4c:e3:78
+python3 ps3_mac_manager.py -g                       # Generate & write random safe unicast MAC
+
+# Pair controller to this computer's Bluetooth adapter (sixpair mode)
+python3 ps3_mac_manager.py -p
+python3 ps3_mac_manager.py -p --adapter hci0        # Choose specific adapter
+
+# Manage named profiles
+python3 ps3_mac_manager.py --save-profile robot1    # Save connected controller's Master MAC
+python3 ps3_mac_manager.py --save-profile robot1 -s 00:1d:0d:4c:e3:78  # Save offline
+python3 ps3_mac_manager.py --apply-profile robot1   # Write 'robot1' MAC to controller
+python3 ps3_mac_manager.py --list-profiles          # List saved profiles & backups
+python3 ps3_mac_manager.py --delete-profile robot1  # Delete a saved profile
+
+# Backup, Restore & Multi-Controller Clone
+python3 ps3_mac_manager.py --restore                # Restore previous MAC from auto-backup
+python3 ps3_mac_manager.py --backup backup.json     # Export controller state to JSON file
+python3 ps3_mac_manager.py --restore backup.json    # Restore from exported JSON file
+python3 ps3_mac_manager.py --clone -a               # Copy Controller #1's MAC to all others
 ```
 
-#### Advanced CLI Options
-```bash
-python3 ps3_mac_checker.py --help
-python3 ps3_mac_checker.py -j                    # Machine-readable JSON output
-python3 ps3_mac_checker.py -n -t 5               # Non-interactive with 5-second timeout
-python3 ps3_mac_checker.py --all                 # Enumerate all connected PS3 controllers
-python3 ps3_mac_checker.py --no-sudo             # Disable automatic sudo re-elevation
-```
-
-### Example Output
+### Example Interactive Output
 
 ```text
 ============================================================
-           PS3 CONTROLLER MAC ADDRESS CHECKER               
+         PS3 CONTROLLER MAC ADDRESS MANAGER v2.0.0         
 ============================================================
 
-[✓] PS3 Controller detected!
+[✓] Detected 1 PS3 Controller(s)!
 
-------------------------------------------------------------
+--- CONTROLLER DETAILS --------------------------------------
+Hardware Path : /sys/bus/hid/devices/0003:054C:0268.0001
+Device Node   : /dev/hidraw0
+
 1. MASTER MAC (Required for ESP32 / Ps3.begin):
    >>  00:1d:0d:4c:e3:78  <<
 
-   Paste this into setup() in your Arduino IDE:
+   Paste into Arduino setup() / C code:
    Ps3.begin("00:1d:0d:4c:e3:78");
-------------------------------------------------------------
+   uint8_t master_mac[6] = {0x00, 0x1d, 0x0d, 0x4c, 0xe3, 0x78};
+
 2. DEVICE MAC (Physical Bluetooth Address of Controller):
    >>  a0:5a:5e:9b:aa:08  <<
 ------------------------------------------------------------
 
-Done! Press [Enter] to close terminal...
+Actions:
+  [1] Change Master MAC address (custom)
+  [2] Profiles (save / apply / delete presets)
+  [3] Generate & write random safe MAC (for ESP32)
+  [4] Pair to this PC's Bluetooth adapter (sixpair)
+  [5] Restore previous Master MAC from backup
+  [6] Refresh / Re-scan controller
+  [Enter / Q] Exit
 ```
 
 ---
 
 ## Technical Details
 
-- **Linux:** Exposes HID devices via `/dev/hidraw*`. Uses `ioctl(fd, HIDIOCGFEAT, buf)` with Feature Report `0xF5` (Master bdaddr) and reads `HID_UNIQ` from sysfs `uevent` (Device bdaddr).
-- **Windows:** Uses Win32 Device Management APIs via `setupapi.dll` (`SetupDiGetClassDevsW` for HID class GUID) to find `VID_054C&PID_0268` interfaces. Opens the interface via `kernel32.dll` (`CreateFileW`) and reads Feature Report `0xF5` (Master bdaddr) and Feature Report `0xF2` (Device bdaddr) via `hid.dll` (`HidD_GetFeature`). No external drivers (e.g. Zadig/ScpToolkit) required.
+- **Linux:** Exposes HID devices via `/dev/hidraw*`. Uses `ioctl(fd, HIDIOCGFEATURE, buf)` and `ioctl(fd, HIDIOCSFEATURE, buf)` on Feature Report `0xF5` (`[0xF5, 0x01, mac0..mac5]`) to read and write the Master Bluetooth MAC, and reads Device MAC from sysfs `HID_UNIQ`, `input*/uniq`, or Feature Report `0xF2`. Local Bluetooth adapters are discovered from `/sys/class/bluetooth/hci*/address`.
+- **Windows:** Uses Win32 Device Management APIs via `setupapi.dll` (`SetupDiGetClassDevsW`) to enumerate `VID_054C&PID_0268` interfaces, `kernel32.dll` (`CreateFileW`) for read/write handles, `hid.dll` (`HidD_GetFeature` / `HidD_SetFeature`) for Feature Reports `0xF5` and `0xF2`, and `bthprops.cpl` (`BluetoothFindFirstRadio` / `BluetoothGetRadioInfo`) for host adapter discovery.
 
 ---
 
