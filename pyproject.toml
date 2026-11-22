@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=77.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ps3-mac-manager"
+version = "2.0.0"
+description = "Zero-dependency cross-platform CLI & TUI tool to read, change, pair, clone, and manage Sony PS3 (DualShock 3 / Sixaxis) Master & Device Bluetooth MAC addresses over USB."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.8"
+authors = [{ name = "Bagus Wijaya (Warsky)" }]
+keywords = ["ps3", "dualshock3", "sixaxis", "bluetooth", "mac", "esp32", "arduino", "hid", "sixpair"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Intended Audience :: End Users/Desktop",
+    "Operating System :: MacOS",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Topic :: System :: Hardware",
+    "Topic :: Utilities",
+]
+
+[project.urls]
+Homepage = "https://github.com/chocowarsky/ps3-mac-manager"
+Repository = "https://github.com/chocowarsky/ps3-mac-manager"
+Issues = "https://github.com/chocowarsky/ps3-mac-manager/issues"
+
+[project.scripts]
+ps3-mac-manager = "ps3_mac_manager:main"
+
+[tool.setuptools]
+py-modules = ["ps3_mac_manager"]
+
+[tool.ruff]
+target-version = "py38"
+line-length = 120
+
+[tool.ruff.lint]
+select = ["F", "E", "W", "B", "S", "C90", "PL", "RUF", "PERF", "PIE", "SIM", "UP", "FURB"]
+ignore = ["PLR2004"]

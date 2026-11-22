@@ -1,43 +1,77 @@
 #!/usr/bin/env python3
-"""
-PS3 Controller MAC Address Manager
+"""PS3 Controller MAC Address Manager.
+
 Read, change, pair, back up, and manage Master & Device MAC addresses on
-Sony PlayStation 3 (DualShock 3 / Sixaxis) controllers via USB HID on Linux & Windows.
+Sony PlayStation 3 (DualShock 3 / Sixaxis) controllers via USB HID on
+Windows, macOS, and Linux.
 
 Author: Bagus Wijaya (Warsky)
 Repository: https://github.com/chocowarsky/ps3-mac-manager
 License: MIT
 """
 
+from __future__ import annotations
+
 import argparse
+import contextlib
+import ctypes
 from datetime import datetime, timezone
 import glob
 import json
 import os
+import platform
+import re
+import shutil
+import subprocess
 import sys
 import time
+from typing import Any, ClassVar
 
 try:
     import fcntl
 except ImportError:
-    fcntl = None
+    fcntl = None  # type: ignore[assignment]
 
 __version__ = "2.0.0"
 
-# Ensure line-buffered output so text appears immediately in terminal
-if hasattr(sys.stdout, "reconfigure"):
-    sys.stdout.reconfigure(line_buffering=True)
+SONY_VID = 0x054C
+PS3_PID = 0x0268
+HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
+
+
+def _configure_console():
+    """Configure UTF-8 output and Win32 ANSI virtual terminal processing."""
+    if hasattr(sys.stdout, "reconfigure"):
+        with contextlib.suppress(ValueError, OSError, LookupError):
+            sys.stdout.reconfigure(encoding="utf-8", errors="replace", line_buffering=True)
+    if sys.platform == "win32" and hasattr(ctypes, "windll"):
+        with contextlib.suppress(OSError, AttributeError):
+            kernel32 = ctypes.windll.kernel32
+            if isinstance(kernel32, ctypes.CDLL) and type(kernel32).__module__ == "ctypes":
+                kernel32.GetStdHandle.argtypes = [ctypes.c_int32]
+                kernel32.GetStdHandle.restype = ctypes.c_void_p
+                kernel32.GetConsoleMode.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32)]
+                kernel32.GetConsoleMode.restype = ctypes.c_int32
+                kernel32.SetConsoleMode.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+                kernel32.SetConsoleMode.restype = ctypes.c_int32
+            handle = kernel32.GetStdHandle(-11)
+            invalid_handle = ctypes.c_void_p(-1).value
+            if handle not in (None, 0, -1, invalid_handle):
+                mode = ctypes.c_uint32(0)
+                if kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+                    kernel32.SetConsoleMode(handle, mode.value | 0x0004)
+
+
+_configure_console()
 
 
 def HIDIOCSFEAT(size):
     """Compute ioctl number for Linux HIDIOCSFEATURE(len)."""
-    # _IOC(_IOC_WRITE|_IOC_READ, 'H', 0x06, size)
     return (3 << 30) | (size << 16) | (ord("H") << 8) | 0x06
 
 
 def HIDIOCGFEAT(size):
     """Compute ioctl number for Linux HIDIOCGFEATURE(len)."""
-    # _IOC(_IOC_WRITE|_IOC_READ, 'H', 0x07, size)
     return (3 << 30) | (size << 16) | (ord("H") << 8) | 0x07
 
 
@@ -57,14 +91,62 @@ def _utc_now_iso():
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
 
+def _is_real_cdll(dll):
+    """Return True when dll is a real ctypes CDLL/WinDLL instance rather than a mock."""
+    return isinstance(dll, ctypes.CDLL) and type(dll).__module__ == "ctypes"
+
+
+def _permission_denied_message(backend_name):
+    """Return an OS-appropriate permission troubleshooting message."""
+    if backend_name == "win32":
+        return "Permission denied opening HID device (close Steam/DS3 drivers or run as Administrator)"
+    if backend_name == "darwin":
+        return "Permission denied opening HID device (grant Terminal Input Monitoring or run with sudo)"
+    return "Permission denied (udev rule required or run with sudo)"
+
+
 # ============================================================================
 # MAC Normalization, Validation, Generation & Snippets
 # ============================================================================
 
+def _strip_mac_wrappers(cleaned):
+    """Strip surrounding quotes or C-array braces from MAC strings."""
+    while len(cleaned) >= 2 and (
+        (cleaned[0] == cleaned[-1] and cleaned[0] in ('"', "'"))
+        or (cleaned[0] == "{" and cleaned[-1] == "}")
+    ):
+        cleaned = cleaned[1:-1].strip()
+    return cleaned
+
+
+def _split_mac_parts(cleaned):
+    """Split supported MAC string formats into raw hex byte strings."""
+    cleaned = _strip_mac_wrappers(cleaned)
+    parts: list[str] = []
+    if "," in cleaned:
+        parts = [part.strip() for part in cleaned.split(",")]
+    elif ":" in cleaned or "-" in cleaned:
+        sep = ":" if ":" in cleaned else "-"
+        parts = [part.strip() for part in cleaned.split(sep)]
+    elif " " in cleaned or "\t" in cleaned:
+        parts = cleaned.split()
+    elif "." in cleaned:
+        groups = cleaned.split(".")
+        if len(groups) == 3 and all(len(g) == 4 for g in groups):
+            joined = "".join(groups)
+            parts = [joined[i:i + 2] for i in range(0, 12, 2)]
+    else:
+        raw = cleaned[2:] if cleaned.lower().startswith("0x") and len(cleaned) == 14 else cleaned
+        if len(raw) == 12:
+            parts = [raw[i:i + 2] for i in range(0, 12, 2)]
+    return parts
+
+
 def normalize_mac(mac_str):
-    """
-    Normalize a Bluetooth MAC address to lowercase colon-separated format (aa:bb:cc:dd:ee:ff).
-    Accepts colon, hyphen, space, Cisco dot (aabb.ccdd.eeff), or raw 12-char hex strings.
+    """Normalize a Bluetooth MAC address to lowercase colon-separated format.
+
+    Accepts colon, hyphen, space, comma-separated C hex bytes (`0x00, ...`),
+    Cisco dot (`aabb.ccdd.eeff`), or raw 12-char hex strings.
     Raises ValueError if the input cannot be parsed as a 6-byte MAC address.
     """
     if not isinstance(mac_str, str):
@@ -79,37 +161,14 @@ def normalize_mac(mac_str):
         raise ValueError(f"Invalid MAC address format: '{mac_str}'")
 
     byte_vals = []
-    for part in octets:
-        if not 1 <= len(part) <= 2:
-            raise ValueError(f"Invalid octet '{part}' in MAC address '{mac_str}'")
-        try:
-            val = int(part, 16)
-        except ValueError as exc:
-            raise ValueError(f"Invalid hexadecimal digit in MAC address '{mac_str}'") from exc
-        if not 0 <= val <= 0xFF:
-            raise ValueError(f"Octet out of range in MAC address '{mac_str}'")
+    for raw_part in octets:
+        part = raw_part[2:] if raw_part.lower().startswith("0x") else raw_part
+        if not 1 <= len(part) <= 2 or not all(ch in HEX_DIGITS for ch in part):
+            raise ValueError(f"Invalid octet '{raw_part}' in MAC address '{mac_str}'")
+        val = int(part, 16)
         byte_vals.append(val)
 
     return ":".join(f"{b:02x}" for b in byte_vals)
-
-
-def _split_mac_parts(cleaned):
-    """Split supported MAC string formats into raw hex byte strings."""
-    for sep in (":", "-", " "):
-        if sep in cleaned:
-            return cleaned.split(sep)
-
-    if "." in cleaned:
-        groups = cleaned.split(".")
-        if len(groups) == 3 and all(len(g) == 4 for g in groups):
-            joined = "".join(groups)
-            return [joined[i:i + 2] for i in range(0, 12, 2)]
-        return []
-
-    if len(cleaned) == 12:
-        return [cleaned[i:i + 2] for i in range(0, 12, 2)]
-
-    return []
 
 
 def mac_to_bytes(mac_str):
@@ -119,8 +178,8 @@ def mac_to_bytes(mac_str):
 
 
 def validate_mac(mac_str):
-    """
-    Validate Bluetooth MAC address format and check for clone/unprogrammed controller signatures.
+    """Validate Bluetooth MAC format and check for clone/unprogrammed signatures.
+
     Returns tuple (is_valid: bool, warning: str or None).
     """
     if not mac_str or mac_str == "Unavailable":
@@ -133,21 +192,22 @@ def validate_mac(mac_str):
     except ValueError:
         return False, "Invalid hexadecimal digits in MAC"
 
+    warning = None
     if any(not 0 <= b <= 0xFF for b in byte_vals):
-        return False, "MAC byte out of range"
-    if all(b == 0 for b in byte_vals):
-        return False, "Warning: Clone or uninitialized controller returned all zeros (00:00:00:00:00:00)"
-    if all(b == 0xFF for b in byte_vals):
-        return False, "Warning: Clone controller returned all 0xFF (unprogrammed EEPROM)"
-    if byte_vals[0] & 0x01:
-        return False, "Warning: Multicast bit is set (invalid for Bluetooth host address)"
+        warning = "MAC byte out of range"
+    elif all(b == 0 for b in byte_vals):
+        warning = "Warning: Clone or uninitialized controller returned all zeros (00:00:00:00:00:00)"
+    elif all(b == 0xFF for b in byte_vals):
+        warning = "Warning: Clone controller returned all 0xFF (unprogrammed EEPROM)"
+    elif byte_vals[0] & 0x01:
+        warning = "Warning: Multicast bit is set (invalid for Bluetooth host address)"
 
-    return True, None
+    return (warning is None), warning
 
 
 def validate_mac_for_write(mac_str, force=False):
-    """
-    Normalize and validate a target Master MAC before writing to controller EEPROM.
+    """Normalize and validate a target Master MAC before writing to EEPROM.
+
     Returns (normalized_mac, warning). Raises ValueError on invalid MAC unless force=True.
     """
     normalized = normalize_mac(mac_str)
@@ -158,14 +218,14 @@ def validate_mac_for_write(mac_str, force=False):
 
 
 def generate_random_mac():
-    """
-    Generate a random, safe locally administered unicast Bluetooth MAC address.
+    """Generate a random, safe locally administered unicast Bluetooth MAC address.
+
     Bit 0 of byte 0 is 0 (unicast) and bit 1 of byte 0 is 1 (locally administered).
     """
     while True:
         raw = os.urandom(6)
         b0 = (raw[0] & 0xFE) | 0x02
-        octets = [b0] + list(raw[1:])
+        octets = [b0, *list(raw[1:])]
         if any(b != 0 for b in octets[1:]) and not all(b == 0xFF for b in octets[1:]):
             return ":".join(f"{b:02x}" for b in octets)
 
@@ -180,11 +240,56 @@ def format_code_snippets(mac_str):
 
 
 # ============================================================================
+# Win32 ctypes Structure Definitions
+# ============================================================================
+
+class _Win32GUID(ctypes.Structure):
+    _fields_: ClassVar[list[tuple[str, Any]]] = [
+        ("Data1", ctypes.c_uint32),
+        ("Data2", ctypes.c_uint16),
+        ("Data3", ctypes.c_uint16),
+        ("Data4", ctypes.c_uint8 * 8),
+    ]
+
+
+class _SPDeviceInterfaceData(ctypes.Structure):
+    _fields_: ClassVar[list[tuple[str, Any]]] = [
+        ("cbSize", ctypes.c_uint32),
+        ("InterfaceClassGuid", _Win32GUID),
+        ("Flags", ctypes.c_uint32),
+        ("Reserved", ctypes.c_void_p),
+    ]
+
+
+class _BluetoothFindRadioParams(ctypes.Structure):
+    _fields_: ClassVar[list[tuple[str, Any]]] = [("dwSize", ctypes.c_uint32)]
+
+
+class _BluetoothAddress(ctypes.Union):
+    _fields_: ClassVar[list[tuple[str, Any]]] = [
+        ("ullLong", ctypes.c_uint64),
+        ("rgBytes", ctypes.c_uint8 * 6),
+    ]
+
+
+class _BluetoothRadioInfo(ctypes.Structure):
+    _fields_: ClassVar[list[tuple[str, Any]]] = [
+        ("dwSize", ctypes.c_uint32),
+        ("address", _BluetoothAddress),
+        ("szName", ctypes.c_uint16 * 248),
+        ("ulClassofDevice", ctypes.c_uint32),
+        ("lmpSubversion", ctypes.c_uint16),
+        ("manufacturer", ctypes.c_uint16),
+    ]
+
+
+# ============================================================================
 # Backend Abstraction Layer
 # ============================================================================
 
 class BaseBackend:
     """Abstract base class for OS-specific USB HID and Bluetooth host access."""
+
     name = "base"
 
     def detect_devices(self):
@@ -214,50 +319,124 @@ class BaseBackend:
 
 class LinuxBackend(BaseBackend):
     """Linux implementation using sysfs, BlueZ sysfs adapters, and /dev/hidraw ioctl."""
+
     name = "linux"
 
     def detect_devices(self):
+        """Enumerate connected Sony DualShock 3 devices in sysfs."""
         return get_ps3_devices()
 
     def find_node(self, device_path):
+        """Resolve sysfs path to /dev/hidrawX."""
         return find_hidraw_node(device_path)
 
     def read_master_mac(self, devnode):
+        """Read Master Host MAC via Linux hidraw feature report 0xF5."""
         return read_master_mac(devnode)
 
     def write_master_mac(self, devnode, mac_str):
+        """Write Master Host MAC via Linux hidraw feature report 0xF5."""
         return write_master_mac(devnode, mac_str)
 
     def read_device_mac(self, device_path):
+        """Read physical Device MAC via sysfs or feature report 0xF2."""
         return read_device_mac(device_path)
 
     def detect_host_bluetooth_macs(self):
+        """Discover local Bluetooth adapters from /sys/class/bluetooth."""
         return detect_linux_bluetooth_macs()
 
 
 class WindowsBackend(BaseBackend):
-    """
-    Windows implementation using standard library ctypes to interact with
-    hid.dll, setupapi.dll, kernel32.dll, and bthprops.cpl without external dependencies.
-    """
+    """Windows implementation using standard library ctypes for Win32 HID & Bluetooth APIs."""
+
     name = "win32"
 
     def __init__(self, setupapi=None, hid=None, kernel32=None, bthprops=None):
+        """Initialize Win32 backend with optional injected DLL mocks for testing."""
         self._setupapi = setupapi
         self._hid = hid
         self._kernel32 = kernel32
         self._bthprops = bthprops
-        self._ctypes = None
-        self._wintypes = None
+        self._initialized = False
+        self._signatures_configured = False
+
+    def _configure_win32_signatures(self):
+        """Set explicit ctypes argtypes/restype on real Win32 DLLs to prevent 64-bit truncation."""
+        if self._signatures_configured:
+            return
+        self._signatures_configured = True
+
+        if _is_real_cdll(self._kernel32):
+            self._kernel32.CreateFileW.argtypes = [
+                ctypes.c_wchar_p,
+                ctypes.c_uint32,
+                ctypes.c_uint32,
+                ctypes.c_void_p,
+                ctypes.c_uint32,
+                ctypes.c_uint32,
+                ctypes.c_void_p,
+            ]
+            self._kernel32.CreateFileW.restype = ctypes.c_void_p
+            self._kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+            self._kernel32.CloseHandle.restype = ctypes.c_int32
+            self._kernel32.GetLastError.argtypes = []
+            self._kernel32.GetLastError.restype = ctypes.c_uint32
+
+        if _is_real_cdll(self._hid):
+            self._hid.HidD_GetHidGuid.argtypes = [ctypes.c_void_p]
+            self._hid.HidD_GetHidGuid.restype = None
+            self._hid.HidD_GetFeature.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint32]
+            self._hid.HidD_GetFeature.restype = ctypes.c_ubyte
+            self._hid.HidD_SetFeature.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint32]
+            self._hid.HidD_SetFeature.restype = ctypes.c_ubyte
+
+        if _is_real_cdll(self._setupapi):
+            self._setupapi.SetupDiGetClassDevsW.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_wchar_p,
+                ctypes.c_void_p,
+                ctypes.c_uint32,
+            ]
+            self._setupapi.SetupDiGetClassDevsW.restype = ctypes.c_void_p
+            self._setupapi.SetupDiEnumDeviceInterfaces.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.c_uint32,
+                ctypes.c_void_p,
+            ]
+            self._setupapi.SetupDiEnumDeviceInterfaces.restype = ctypes.c_int32
+            self._setupapi.SetupDiGetDeviceInterfaceDetailW.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.c_uint32,
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+            ]
+            self._setupapi.SetupDiGetDeviceInterfaceDetailW.restype = ctypes.c_int32
+            self._setupapi.SetupDiDestroyDeviceInfoList.argtypes = [ctypes.c_void_p]
+            self._setupapi.SetupDiDestroyDeviceInfoList.restype = ctypes.c_int32
+
+    def _configure_bthprops_signatures(self, bthprops):
+        """Configure ctypes argtypes/restype for Bluetooth radio discovery DLL."""
+        if not _is_real_cdll(bthprops):
+            return
+        bthprops.BluetoothFindFirstRadio.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        bthprops.BluetoothFindFirstRadio.restype = ctypes.c_void_p
+        bthprops.BluetoothFindNextRadio.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        bthprops.BluetoothFindNextRadio.restype = ctypes.c_int32
+        bthprops.BluetoothGetRadioInfo.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        bthprops.BluetoothGetRadioInfo.restype = ctypes.c_uint32
+        bthprops.BluetoothFindRadioClose.argtypes = [ctypes.c_void_p]
+        bthprops.BluetoothFindRadioClose.restype = ctypes.c_int32
 
     def _init_win32(self):
-        if self._ctypes is not None:
+        """Load Win32 DLLs lazily and initialize signatures."""
+        if self._initialized:
             return
-        import ctypes
-        from ctypes import wintypes
-        self._ctypes = ctypes
-        self._wintypes = wintypes
-
+        self._initialized = True
         if hasattr(ctypes, "windll"):
             if self._setupapi is None:
                 self._setupapi = ctypes.windll.setupapi
@@ -265,44 +444,46 @@ class WindowsBackend(BaseBackend):
                 self._hid = ctypes.windll.hid
             if self._kernel32 is None:
                 self._kernel32 = ctypes.windll.kernel32
+        self._configure_win32_signatures()
 
     def _open_hid_handle(self, device_path, raise_on_error=True):
-        """Open a Win32 HID device interface handle with read/write access."""
+        """Open a Win32 HID device interface handle, falling back to query-only sharing."""
         self._init_win32()
         if not self._kernel32 or not self._hid:
             if raise_on_error:
                 raise OSError("Win32 HID subsystem not available")
             return None
 
-        ctypes = self._ctypes
-        GENERIC_READ = 0x80000000
-        GENERIC_WRITE = 0x40000000
-        FILE_SHARE_READ = 0x00000001
-        FILE_SHARE_WRITE = 0x00000002
-        OPEN_EXISTING = 3
-
-        handle = self._kernel32.CreateFileW(
-            device_path,
-            GENERIC_READ | GENERIC_WRITE,
-            FILE_SHARE_READ | FILE_SHARE_WRITE,
-            None,
-            OPEN_EXISTING,
-            0,
-            None,
-        )
-
+        generic_rw = 0x80000000 | 0x40000000
+        file_share_rw = 0x00000001 | 0x00000002
+        open_existing = 3
         invalid_handle = ctypes.c_void_p(-1).value
-        if handle == invalid_handle or handle == -1:
-            if not raise_on_error:
-                return None
-            err = self._kernel32.GetLastError()
-            if err == 5:
-                raise PermissionError("Access denied opening Win32 HID device")
-            if err in (2, 1167):
-                raise FileNotFoundError("Device disconnected")
-            raise OSError(f"Failed to open HID device (Win32 Error {err})")
 
-        return handle
+        handle = invalid_handle
+        err = 0
+        for desired_access in (generic_rw, 0):
+            handle = self._kernel32.CreateFileW(
+                device_path,
+                desired_access,
+                file_share_rw,
+                None,
+                open_existing,
+                0,
+                None,
+            )
+            if handle not in (invalid_handle, -1, None, 0):
+                return handle
+            err = self._kernel32.GetLastError()
+            if err not in (5, 32):
+                break
+
+        if not raise_on_error:
+            return None
+        if err in (5, 32):
+            raise PermissionError(_permission_denied_message(self.name))
+        if err in (2, 1167):
+            raise FileNotFoundError("Device disconnected")
+        raise OSError(f"Failed to open HID device (Win32 Error {err})")
 
     def detect_devices(self):
         """Enumerate Win32 HID device interface paths matching Sony DualShock 3 (054C:0268)."""
@@ -310,56 +491,37 @@ class WindowsBackend(BaseBackend):
         if not self._setupapi or not self._hid:
             return []
 
-        ctypes = self._ctypes
-        wintypes = self._wintypes
-
-        class GUID(ctypes.Structure):
-            _fields_ = [
-                ("Data1", wintypes.DWORD),
-                ("Data2", wintypes.WORD),
-                ("Data3", wintypes.WORD),
-                ("Data4", wintypes.BYTE * 8),
-            ]
-
-        class SP_DEVICE_INTERFACE_DATA(ctypes.Structure):
-            _fields_ = [
-                ("cbSize", wintypes.DWORD),
-                ("InterfaceClassGuid", GUID),
-                ("Flags", wintypes.DWORD),
-                ("Reserved", ctypes.POINTER(ctypes.c_ulong)),
-            ]
-
-        hid_guid = GUID()
+        hid_guid = _Win32GUID()
         self._hid.HidD_GetHidGuid(ctypes.byref(hid_guid))
 
-        DIGCF_PRESENT = 0x00000002
-        DIGCF_DEVICEINTERFACE = 0x00000010
+        digcf_present = 0x00000002
+        digcf_deviceinterface = 0x00000010
         hdevinfo = self._setupapi.SetupDiGetClassDevsW(
             ctypes.byref(hid_guid),
             None,
             None,
-            DIGCF_PRESENT | DIGCF_DEVICEINTERFACE,
+            digcf_present | digcf_deviceinterface,
         )
-        if hdevinfo == -1 or hdevinfo == ctypes.c_void_p(-1).value:
+        invalid_handle = ctypes.c_void_p(-1).value
+        if hdevinfo in (invalid_handle, -1, None, 0):
             return []
 
         devices = []
         try:
             device_index = 0
-            interface_data = SP_DEVICE_INTERFACE_DATA()
-            interface_data.cbSize = ctypes.sizeof(SP_DEVICE_INTERFACE_DATA)
+            interface_data = _SPDeviceInterfaceData(cbSize=ctypes.sizeof(_SPDeviceInterfaceData))
 
             while self._setupapi.SetupDiEnumDeviceInterfaces(
                 hdevinfo, None, ctypes.byref(hid_guid), device_index, ctypes.byref(interface_data)
             ):
-                required_size = wintypes.DWORD()
+                required_size = ctypes.c_uint32(0)
                 self._setupapi.SetupDiGetDeviceInterfaceDetailW(
                     hdevinfo, ctypes.byref(interface_data), None, 0, ctypes.byref(required_size), None
                 )
 
                 if required_size.value > 0:
                     detail_buffer = ctypes.create_string_buffer(required_size.value)
-                    cb_size = 8 if ctypes.sizeof(ctypes.c_void_p) == 8 else 5
+                    cb_size = 8 if ctypes.sizeof(ctypes.c_void_p) == 8 else 6
                     ctypes.c_uint32.from_buffer(detail_buffer).value = cb_size
 
                     if self._setupapi.SetupDiGetDeviceInterfaceDetailW(
@@ -376,34 +538,35 @@ class WindowsBackend(BaseBackend):
         return sorted(set(devices))
 
     def find_node(self, device_path):
+        """Return the Win32 device interface path."""
         return device_path
 
-    def read_master_mac(self, device_path):
+    def read_master_mac(self, devnode):
         """Read Master Host MAC from DualShock 3 via Win32 HID Feature Report 0xF5."""
-        handle = self._open_hid_handle(device_path, raise_on_error=True)
-        ctypes = self._ctypes
+        handle = self._open_hid_handle(devnode, raise_on_error=True)
         try:
-            buf = bytearray([0xF5] + [0] * 63)
-            c_buf = (ctypes.c_ubyte * len(buf)).from_buffer(buf)
-            res = self._hid.HidD_GetFeature(handle, c_buf, len(buf))
-            if not res:
-                err = self._kernel32.GetLastError()
-                raise OSError(f"HidD_GetFeature report 0xF5 failed (Win32 Error {err})")
-            return ":".join(f"{b:02x}" for b in buf[2:8]).lower()
+            for buf_size in (64, 8, 65):
+                buf = bytearray([0xF5] + [0] * (buf_size - 1))
+                c_buf = (ctypes.c_ubyte * len(buf)).from_buffer(buf)
+                if self._hid.HidD_GetFeature(handle, c_buf, len(buf)):
+                    return ":".join(f"{b:02x}" for b in buf[2:8]).lower()
+            err = self._kernel32.GetLastError()
+            raise OSError(f"HidD_GetFeature report 0xF5 failed (Win32 Error {err})")
         finally:
             self._kernel32.CloseHandle(handle)
 
-    def write_master_mac(self, device_path, mac_str):
+    def write_master_mac(self, devnode, mac_str):
         """Write Master Host MAC to DualShock 3 via Win32 HID Feature Report 0xF5."""
         normalized = normalize_mac(mac_str)
         mac_bytes = mac_to_bytes(normalized)
-        handle = self._open_hid_handle(device_path, raise_on_error=True)
-        ctypes = self._ctypes
+        handle = self._open_hid_handle(devnode, raise_on_error=True)
         try:
-            for payload in (
-                bytearray([0xF5, 0x01] + mac_bytes + [0] * 56),
-                bytearray([0xF5, 0x01] + mac_bytes),
-            ):
+            payloads = (
+                bytearray([0xF5, 0x01, *mac_bytes] + [0] * 56),
+                bytearray([0xF5, 0x01, *mac_bytes]),
+                bytearray([0xF5, 0x01, *mac_bytes] + [0] * 57),
+            )
+            for payload in payloads:
                 c_buf = (ctypes.c_ubyte * len(payload)).from_buffer(payload)
                 if self._hid.HidD_SetFeature(handle, c_buf, len(payload)):
                     return normalized
@@ -418,57 +581,56 @@ class WindowsBackend(BaseBackend):
         if not handle:
             return "Unavailable"
 
-        ctypes = self._ctypes
         try:
-            buf = bytearray([0xF2] + [0] * 63)
-            c_buf = (ctypes.c_ubyte * len(buf)).from_buffer(buf)
-            res = self._hid.HidD_GetFeature(handle, c_buf, len(buf))
-            if res:
-                mac_bytes = buf[4:10]
-                if any(b != 0 for b in mac_bytes):
-                    return ":".join(f"{b:02x}" for b in mac_bytes).lower()
+            for buf_size in (64, 18, 17, 65):
+                buf = bytearray([0xF2] + [0] * (buf_size - 1))
+                c_buf = (ctypes.c_ubyte * len(buf)).from_buffer(buf)
+                if self._hid.HidD_GetFeature(handle, c_buf, len(buf)):
+                    mac_bytes = buf[4:10]
+                    if any(b != 0 for b in mac_bytes):
+                        return ":".join(f"{b:02x}" for b in mac_bytes).lower()
             return "Unavailable"
         finally:
             self._kernel32.CloseHandle(handle)
 
+    def _load_bthprops_dll(self):
+        """Locate and load Windows Bluetooth control panel library if present."""
+        if self._bthprops is not None:
+            self._configure_bthprops_signatures(self._bthprops)
+            return self._bthprops
+        if hasattr(ctypes, "windll"):
+            for dll_name in ("bthprops.cpl", "irprops.cpl"):
+                try:
+                    loaded = ctypes.WinDLL(dll_name)
+                except OSError:
+                    continue
+                self._bthprops = loaded
+                self._configure_bthprops_signatures(loaded)
+                return loaded
+        return None
+
+    def _read_radio_adapter_info(self, bthprops, radio_handle, idx):
+        """Extract normalized MAC address and adapter name for a single Win32 radio."""
+        info = _BluetoothRadioInfo(dwSize=ctypes.sizeof(_BluetoothRadioInfo))
+        if bthprops.BluetoothGetRadioInfo(radio_handle, ctypes.byref(info)) != 0:
+            return None
+        mac_bytes = list(info.address.rgBytes[:6])[::-1]
+        if not any(b != 0 for b in mac_bytes):
+            return None
+        mac_str = ":".join(f"{b:02x}" for b in mac_bytes)
+        raw_name = bytes(info.szName).decode("utf-16-le", errors="ignore")
+        adapter_name = raw_name.split("\x00", 1)[0].strip() or f"bt{idx}"
+        return {"adapter": adapter_name, "address": mac_str}
+
     def detect_host_bluetooth_macs(self):
         """Discover local Bluetooth adapter MACs on Windows via bthprops.cpl."""
         self._init_win32()
-        ctypes = self._ctypes
-        wintypes = self._wintypes
-
-        bthprops = self._bthprops
-        if bthprops is None and hasattr(ctypes, "windll"):
-            for dll_name in ("bthprops.cpl", "irprops.cpl"):
-                try:
-                    bthprops = ctypes.WinDLL(dll_name)
-                    break
-                except OSError:
-                    continue
+        bthprops = self._load_bthprops_dll()
         if not bthprops or not self._kernel32:
             return []
 
-        class BLUETOOTH_FIND_RADIO_PARAMS(ctypes.Structure):
-            _fields_ = [("dwSize", ctypes.c_uint32)]
-
-        class BLUETOOTH_ADDRESS(ctypes.Union):
-            _fields_ = [
-                ("ullLong", ctypes.c_uint64),
-                ("rgBytes", ctypes.c_ubyte * 6),
-            ]
-
-        class BLUETOOTH_RADIO_INFO(ctypes.Structure):
-            _fields_ = [
-                ("dwSize", ctypes.c_uint32),
-                ("address", BLUETOOTH_ADDRESS),
-                ("szName", ctypes.c_uint16 * 248),
-                ("ulClassofDevice", ctypes.c_uint32),
-                ("lmpSubversion", ctypes.c_uint16),
-                ("manufacturer", ctypes.c_uint16),
-            ]
-
-        params = BLUETOOTH_FIND_RADIO_PARAMS(dwSize=ctypes.sizeof(BLUETOOTH_FIND_RADIO_PARAMS))
-        radio_handle = wintypes.HANDLE()
+        params = _BluetoothFindRadioParams(dwSize=ctypes.sizeof(_BluetoothFindRadioParams))
+        radio_handle = ctypes.c_void_p()
         find_handle = bthprops.BluetoothFindFirstRadio(ctypes.byref(params), ctypes.byref(radio_handle))
         if not find_handle:
             return []
@@ -477,17 +639,9 @@ class WindowsBackend(BaseBackend):
         idx = 0
         try:
             while True:
-                info = BLUETOOTH_RADIO_INFO(dwSize=ctypes.sizeof(BLUETOOTH_RADIO_INFO))
-                if bthprops.BluetoothGetRadioInfo(radio_handle, ctypes.byref(info)) == 0:
-                    mac_bytes = list(info.address.rgBytes[:6])[::-1]
-                    mac_str = ":".join(f"{b:02x}" for b in mac_bytes)
-                    if any(b != 0 for b in mac_bytes):
-                        raw_name = bytes(info.szName).decode("utf-16-le", errors="ignore")
-                        adapter_name = raw_name.split("\x00", 1)[0].strip() or f"bt{idx}"
-                        adapters.append({
-                            "adapter": adapter_name,
-                            "address": mac_str,
-                        })
+                entry = self._read_radio_adapter_info(bthprops, radio_handle, idx)
+                if entry:
+                    adapters.append(entry)
                 self._kernel32.CloseHandle(radio_handle)
                 idx += 1
                 if not bthprops.BluetoothFindNextRadio(find_handle, ctypes.byref(radio_handle)):
@@ -500,11 +654,423 @@ class WindowsBackend(BaseBackend):
         return adapters
 
 
+class MacOSBackend(BaseBackend):
+    """macOS implementation using native IOKit/CoreFoundation HID APIs via ctypes."""
+
+    name = "darwin"
+    IOKIT_PATH = "/System/Library/Frameworks/IOKit.framework/IOKit"
+    CF_PATH = "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation"
+    _K_CF_STRING_UTF8 = 0x08000100
+    _K_CF_NUMBER_SINT32 = 3
+    _K_IOHID_REPORT_FEATURE = 2
+    _PERMISSION_IORETURNS = frozenset({0xE00002C7, 0xE00002C5, 0xE00002C1})
+
+    def __init__(self, iokit=None, cf=None, runner=None):
+        """Initialize macOS backend with optional injected framework mocks for testing."""
+        self._iokit = iokit
+        self._cf = cf
+        self._runner = runner
+        self._initialized = False
+
+    def _configure_darwin_signatures(self):
+        """Set explicit ctypes signatures for 64-bit Intel & Apple Silicon macOS frameworks."""
+        if _is_real_cdll(self._cf):
+            self._cf.CFStringCreateWithCString.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_uint32]
+            self._cf.CFStringCreateWithCString.restype = ctypes.c_void_p
+            self._cf.CFStringGetCString.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_char_p,
+                ctypes.c_ssize_t,
+                ctypes.c_uint32,
+            ]
+            self._cf.CFStringGetCString.restype = ctypes.c_ubyte
+            self._cf.CFNumberGetValue.argtypes = [ctypes.c_void_p, ctypes.c_ssize_t, ctypes.c_void_p]
+            self._cf.CFNumberGetValue.restype = ctypes.c_ubyte
+            self._cf.CFSetGetCount.argtypes = [ctypes.c_void_p]
+            self._cf.CFSetGetCount.restype = ctypes.c_ssize_t
+            self._cf.CFSetGetValues.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+            self._cf.CFSetGetValues.restype = None
+            self._cf.CFGetTypeID.argtypes = [ctypes.c_void_p]
+            self._cf.CFGetTypeID.restype = ctypes.c_ulong
+            self._cf.CFStringGetTypeID.argtypes = []
+            self._cf.CFStringGetTypeID.restype = ctypes.c_ulong
+            self._cf.CFNumberGetTypeID.argtypes = []
+            self._cf.CFNumberGetTypeID.restype = ctypes.c_ulong
+            self._cf.CFRelease.argtypes = [ctypes.c_void_p]
+            self._cf.CFRelease.restype = None
+
+        if _is_real_cdll(self._iokit):
+            self._iokit.IOHIDManagerCreate.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+            self._iokit.IOHIDManagerCreate.restype = ctypes.c_void_p
+            self._iokit.IOHIDManagerSetDeviceMatching.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+            self._iokit.IOHIDManagerSetDeviceMatching.restype = None
+            self._iokit.IOHIDManagerOpen.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+            self._iokit.IOHIDManagerOpen.restype = ctypes.c_int32
+            self._iokit.IOHIDManagerClose.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+            self._iokit.IOHIDManagerClose.restype = ctypes.c_int32
+            self._iokit.IOHIDManagerCopyDevices.argtypes = [ctypes.c_void_p]
+            self._iokit.IOHIDManagerCopyDevices.restype = ctypes.c_void_p
+            self._iokit.IOHIDDeviceGetProperty.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+            self._iokit.IOHIDDeviceGetProperty.restype = ctypes.c_void_p
+            self._iokit.IOHIDDeviceOpen.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+            self._iokit.IOHIDDeviceOpen.restype = ctypes.c_int32
+            self._iokit.IOHIDDeviceClose.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+            self._iokit.IOHIDDeviceClose.restype = ctypes.c_int32
+            self._iokit.IOHIDDeviceGetReport.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_int32,
+                ctypes.c_ssize_t,
+                ctypes.c_void_p,
+                ctypes.POINTER(ctypes.c_ssize_t),
+            ]
+            self._iokit.IOHIDDeviceGetReport.restype = ctypes.c_int32
+            self._iokit.IOHIDDeviceSetReport.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_int32,
+                ctypes.c_ssize_t,
+                ctypes.c_void_p,
+                ctypes.c_ssize_t,
+            ]
+            self._iokit.IOHIDDeviceSetReport.restype = ctypes.c_int32
+
+    def _init_darwin(self):
+        """Load macOS IOKit and CoreFoundation libraries lazily."""
+        if self._initialized:
+            return
+        self._initialized = True
+        if sys.platform == "darwin":
+            if self._iokit is None and os.path.exists(self.IOKIT_PATH):
+                self._iokit = ctypes.CDLL(self.IOKIT_PATH)
+            if self._cf is None and os.path.exists(self.CF_PATH):
+                self._cf = ctypes.CDLL(self.CF_PATH)
+        self._configure_darwin_signatures()
+
+    def _make_cf_string(self, text):
+        """Create a CFStringRef from UTF-8 Python text."""
+        return self._cf.CFStringCreateWithCString(None, text.encode("utf-8"), self._K_CF_STRING_UTF8)
+
+    def _get_hid_int_property(self, dev_ref, key):
+        """Read an integer IOHIDDevice property."""
+        cf_key = self._make_cf_string(key)
+        if not cf_key:
+            return None
+        try:
+            prop_ref = self._iokit.IOHIDDeviceGetProperty(dev_ref, cf_key)
+            if not prop_ref:
+                return None
+            val = ctypes.c_int32(0)
+            if self._cf.CFNumberGetValue(prop_ref, self._K_CF_NUMBER_SINT32, ctypes.byref(val)):
+                return int(val.value)
+            return None
+        finally:
+            self._cf.CFRelease(cf_key)
+
+    def _get_hid_str_property(self, dev_ref, key):
+        """Read a string IOHIDDevice property."""
+        cf_key = self._make_cf_string(key)
+        if not cf_key:
+            return None
+        try:
+            prop_ref = self._iokit.IOHIDDeviceGetProperty(dev_ref, cf_key)
+            if not prop_ref:
+                return None
+            if (
+                hasattr(self._cf, "CFGetTypeID")
+                and hasattr(self._cf, "CFStringGetTypeID")
+                and self._cf.CFGetTypeID(prop_ref) != self._cf.CFStringGetTypeID()
+            ):
+                return None
+            buf = ctypes.create_string_buffer(256)
+            if self._cf.CFStringGetCString(prop_ref, buf, len(buf), self._K_CF_STRING_UTF8):
+                return buf.value.decode("utf-8", errors="ignore").strip() or None
+            return None
+        finally:
+            self._cf.CFRelease(cf_key)
+
+    def _enumerate_matching_hid_devices(self):
+        """Open an IOHIDManager and return (manager, [(device_id, dev_ref), ...])."""
+        self._init_darwin()
+        if not self._iokit or not self._cf:
+            return None, []
+
+        manager = self._iokit.IOHIDManagerCreate(None, 0)
+        if not manager:
+            return None, []
+
+        self._iokit.IOHIDManagerSetDeviceMatching(manager, None)
+        self._iokit.IOHIDManagerOpen(manager, 0)
+        device_set = self._iokit.IOHIDManagerCopyDevices(manager)
+        if not device_set:
+            return manager, []
+
+        matched = []
+        try:
+            count = int(self._cf.CFSetGetCount(device_set))
+            if count > 0:
+                refs = (ctypes.c_void_p * count)()
+                self._cf.CFSetGetValues(device_set, refs)
+                for idx, dev_ref in enumerate(refs):
+                    if not dev_ref:
+                        continue
+                    vid = self._get_hid_int_property(dev_ref, "VendorID")
+                    pid = self._get_hid_int_property(dev_ref, "ProductID")
+                    if vid == SONY_VID and pid == PS3_PID:
+                        loc_id = self._get_hid_int_property(dev_ref, "LocationID")
+                        suffix = f"{loc_id:08x}" if loc_id is not None else str(idx)
+                        matched.append((f"iokit://054c:0268/{suffix}", dev_ref))
+        finally:
+            self._cf.CFRelease(device_set)
+
+        matched.sort(key=lambda item: item[0])
+        return manager, matched
+
+    def _close_manager(self, manager):
+        """Close and release an IOHIDManager handle."""
+        if manager and self._iokit and self._cf:
+            with contextlib.suppress(OSError, AttributeError):
+                self._iokit.IOHIDManagerClose(manager, 0)
+                self._cf.CFRelease(manager)
+
+    def _run_cmd(self, cmd):
+        """Execute a macOS CLI utility cleanly using injected runner or subprocess."""
+        if self._runner is not None:
+            return self._runner(cmd)
+        if sys.platform != "darwin":
+            return None
+        exe = shutil.which(cmd[0]) or cmd[0]
+        full_cmd = [exe, *cmd[1:]]
+        return subprocess.run(full_cmd, capture_output=True, text=True, timeout=10, check=False)  # noqa: S603
+
+    def _detect_via_ioreg(self):
+        """Fallback USB enumeration via ioreg when IOHIDManager finds no accessible HID node."""
+        proc = self._run_cmd(["/usr/sbin/ioreg", "-r", "-c", "IOUSBHostDevice", "-l"])
+        if not proc or getattr(proc, "returncode", 1) != 0 or not getattr(proc, "stdout", ""):
+            return []
+
+        devices = []
+        blocks = proc.stdout.split("+-o ")
+        for idx, block in enumerate(blocks):
+            vid_match = re.search(r'"idVendor"\s*=\s*(1356|0x0?54c)\b', block, re.IGNORECASE)
+            pid_match = re.search(r'"idProduct"\s*=\s*(616|0x0?268)\b', block, re.IGNORECASE)
+            if vid_match and pid_match:
+                loc_match = re.search(r'"locationID"\s*=\s*(0x[0-9a-fA-F]+|\d+)', block)
+                suffix = f"{int(loc_match.group(1), 0):08x}" if loc_match else str(idx)
+                devices.append(f"iokit://054c:0268/{suffix}")
+        return sorted(set(devices))
+
+    def detect_devices(self):
+        """Enumerate connected DualShock 3 devices on macOS via IOKit HID Manager."""
+        manager, matched = self._enumerate_matching_hid_devices()
+        try:
+            if matched:
+                return [dev_id for dev_id, _ in matched]
+        finally:
+            self._close_manager(manager)
+        return self._detect_via_ioreg()
+
+    def find_node(self, device_path):
+        """Return the IOKit device identifier."""
+        return device_path
+
+    def _resolve_device_ref(self, devnode):
+        """Open IOHIDManager and locate the matching IOHIDDeviceRef for devnode."""
+        manager, matched = self._enumerate_matching_hid_devices()
+        if not matched:
+            self._close_manager(manager)
+            raise FileNotFoundError(f"PS3 controller not accessible via IOKit ({devnode})")
+        for dev_id, dev_ref in matched:
+            if dev_id == devnode:
+                return manager, dev_ref
+        return manager, matched[0][1]
+
+    def _open_iokit_device(self, dev_ref):
+        """Open an IOHIDDeviceRef and translate permission errors clearly."""
+        ret = self._iokit.IOHIDDeviceOpen(dev_ref, 0)
+        if ret == 0:
+            return
+        ret_u32 = ret & 0xFFFFFFFF
+        if ret_u32 in self._PERMISSION_IORETURNS:
+            raise PermissionError(_permission_denied_message(self.name))
+        raise OSError(f"IOHIDDeviceOpen failed (IOReturn 0x{ret_u32:08x})")
+
+    def _get_feature_report(self, dev_ref, report_id, sizes):
+        """Try reading an IOKit HID feature report across candidate buffer lengths."""
+        last_ret = -1
+        for size in sizes:
+            buf = bytearray([report_id] + [0] * (size - 1))
+            c_buf = (ctypes.c_ubyte * len(buf)).from_buffer(buf)
+            report_len = ctypes.c_ssize_t(len(buf))
+            ret = self._iokit.IOHIDDeviceGetReport(
+                dev_ref,
+                self._K_IOHID_REPORT_FEATURE,
+                report_id,
+                c_buf,
+                ctypes.byref(report_len),
+            )
+            if ret == 0:
+                return buf, int(report_len.value)
+            last_ret = ret
+        raise OSError(f"IOHIDDeviceGetReport 0x{report_id:02X} failed (IOReturn 0x{last_ret & 0xFFFFFFFF:08x})")
+
+    def read_master_mac(self, devnode):
+        """Read Master Host MAC from DualShock 3 via macOS IOHIDDeviceGetReport 0xF5."""
+        manager, dev_ref = self._resolve_device_ref(devnode)
+        try:
+            self._open_iokit_device(dev_ref)
+            try:
+                buf, actual_len = self._get_feature_report(dev_ref, 0xF5, (64, 8))
+                if actual_len >= 8 and buf[0] == 0xF5:
+                    mac_bytes = buf[2:8]
+                elif actual_len >= 7:
+                    mac_bytes = buf[1:7]
+                else:
+                    raise OSError(f"Unexpected 0xF5 feature report length: {actual_len}")
+                return ":".join(f"{b:02x}" for b in mac_bytes).lower()
+            finally:
+                self._iokit.IOHIDDeviceClose(dev_ref, 0)
+        finally:
+            self._close_manager(manager)
+
+    def write_master_mac(self, devnode, mac_str):
+        """Write Master Host MAC to DualShock 3 via macOS IOHIDDeviceSetReport 0xF5."""
+        normalized = normalize_mac(mac_str)
+        mac_bytes = mac_to_bytes(normalized)
+        manager, dev_ref = self._resolve_device_ref(devnode)
+        try:
+            self._open_iokit_device(dev_ref)
+            try:
+                payloads = (
+                    bytearray([0xF5, 0x01, *mac_bytes]),
+                    bytearray([0xF5, 0x01, *mac_bytes] + [0] * 56),
+                    bytearray([0x01, *mac_bytes]),
+                )
+                last_ret = -1
+                for payload in payloads:
+                    c_buf = (ctypes.c_ubyte * len(payload)).from_buffer(payload)
+                    ret = self._iokit.IOHIDDeviceSetReport(
+                        dev_ref,
+                        self._K_IOHID_REPORT_FEATURE,
+                        0xF5,
+                        c_buf,
+                        len(payload),
+                    )
+                    if ret == 0:
+                        return normalized
+                    last_ret = ret
+                last_u32 = last_ret & 0xFFFFFFFF
+                if last_u32 in self._PERMISSION_IORETURNS:
+                    raise PermissionError(_permission_denied_message(self.name))
+                raise OSError(f"IOHIDDeviceSetReport 0xF5 failed (IOReturn 0x{last_u32:08x})")
+            finally:
+                self._iokit.IOHIDDeviceClose(dev_ref, 0)
+        finally:
+            self._close_manager(manager)
+
+    def read_device_mac(self, device_path):
+        """Read physical Device MAC via SerialNumber property or IOKit Report 0xF2."""
+        try:
+            manager, dev_ref = self._resolve_device_ref(device_path)
+        except OSError:
+            return "Unavailable"
+
+        try:
+            serial = self._get_hid_str_property(dev_ref, "SerialNumber")
+            if serial:
+                with contextlib.suppress(ValueError):
+                    norm = normalize_mac(serial)
+                    if any(b != 0 for b in mac_to_bytes(norm)):
+                        return norm
+
+            with contextlib.suppress(OSError, PermissionError):
+                self._open_iokit_device(dev_ref)
+                try:
+                    buf, actual_len = self._get_feature_report(dev_ref, 0xF2, (64, 18, 17))
+                    mac_bytes = buf[4:10] if actual_len >= 10 and buf[0] == 0xF2 else buf[3:9]
+                    if len(mac_bytes) == 6 and any(b != 0 for b in mac_bytes):
+                        return ":".join(f"{b:02x}" for b in mac_bytes).lower()
+                finally:
+                    self._iokit.IOHIDDeviceClose(dev_ref, 0)
+            return "Unavailable"
+        finally:
+            self._close_manager(manager)
+
+    def _extract_bt_from_json_obj(self, obj, results):
+        """Recursively search system_profiler JSON output for local Bluetooth controller MAC."""
+        if isinstance(obj, dict):
+            props = obj.get("controller_properties")
+            if isinstance(props, dict) and props.get("controller_address"):
+                with contextlib.suppress(ValueError):
+                    norm = normalize_mac(str(props["controller_address"]))
+                    if validate_mac(norm)[0]:
+                        name = str(props.get("controller_name") or "macOS Bluetooth")
+                        results.append({"adapter": name, "address": norm})
+            if obj.get("device_title") and obj.get("Address"):
+                with contextlib.suppress(ValueError):
+                    norm = normalize_mac(str(obj["Address"]))
+                    if validate_mac(norm)[0]:
+                        results.append({"adapter": str(obj["device_title"]), "address": norm})
+            for value in obj.values():
+                self._extract_bt_from_json_obj(value, results)
+        elif isinstance(obj, list):
+            for item in obj:
+                self._extract_bt_from_json_obj(item, results)
+
+    def _detect_bt_from_system_profiler_json(self):
+        """Parse local macOS Bluetooth address from system_profiler JSON output."""
+        adapters: list[dict[str, str]] = []
+        proc = self._run_cmd(["/usr/sbin/system_profiler", "SPBluetoothDataType", "-json"])
+        if proc and getattr(proc, "returncode", 1) == 0 and getattr(proc, "stdout", ""):
+            with contextlib.suppress(json.JSONDecodeError):
+                self._extract_bt_from_json_obj(json.loads(proc.stdout), adapters)
+        return adapters
+
+    def _detect_bt_from_system_profiler_text(self):
+        """Parse local macOS Bluetooth address from plain-text system_profiler output."""
+        proc = self._run_cmd(["/usr/sbin/system_profiler", "SPBluetoothDataType"])
+        if not proc or getattr(proc, "returncode", 1) != 0 or not getattr(proc, "stdout", ""):
+            return []
+        match = re.search(r"Address:\s*([0-9A-Fa-f]{2}(?:[:-][0-9A-Fa-f]{2}){5})", proc.stdout)
+        if not match:
+            return []
+        with contextlib.suppress(ValueError):
+            norm = normalize_mac(match.group(1))
+            if validate_mac(norm)[0]:
+                return [{"adapter": "macOS Bluetooth", "address": norm}]
+        return []
+
+    def _detect_bt_from_ioreg(self):
+        """Parse local macOS Bluetooth address from ioreg IOBluetoothHCIController."""
+        proc = self._run_cmd(["/usr/sbin/ioreg", "-r", "-c", "IOBluetoothHCIController"])
+        if not proc or getattr(proc, "returncode", 1) != 0 or not getattr(proc, "stdout", ""):
+            return []
+        match = re.search(r'"BluetoothDeviceAddress"\s*=\s*<([0-9a-fA-F ]+)>', proc.stdout)
+        if not match:
+            return []
+        hex_str = match.group(1).replace(" ", "")
+        if len(hex_str) != 12:
+            return []
+        with contextlib.suppress(ValueError):
+            norm = normalize_mac(hex_str)
+            if validate_mac(norm)[0]:
+                return [{"adapter": "IOBluetoothHCIController", "address": norm}]
+        return []
+
+    def detect_host_bluetooth_macs(self):
+        """Discover local Bluetooth adapter MAC on macOS via system_profiler / ioreg."""
+        return (
+            self._detect_bt_from_system_profiler_json()
+            or self._detect_bt_from_system_profiler_text()
+            or self._detect_bt_from_ioreg()
+        )
+
+
 def get_backend(platform_name=None):
     """Factory returning the appropriate platform backend."""
     plat = platform_name if platform_name is not None else sys.platform
     if plat == "win32":
         return WindowsBackend()
+    if plat == "darwin":
+        return MacOSBackend()
     return LinuxBackend()
 
 
@@ -513,10 +1079,7 @@ def get_backend(platform_name=None):
 # ============================================================================
 
 def get_ps3_devices():
-    """
-    Find sysfs device entries for connected PS3 controllers (Sony VID:PID 054C:0268).
-    Deduplicates results and sorts paths deterministically.
-    """
+    """Find sysfs device entries for connected PS3 controllers (Sony VID:PID 054C:0268)."""
     patterns = [
         "/sys/bus/hid/devices/*054C:0268*",
         "/sys/bus/hid/devices/*054c:0268*",
@@ -529,13 +1092,10 @@ def get_ps3_devices():
 
 
 def find_hidraw_node(device_path):
-    """
-    Find corresponding /dev/hidrawX character device node on Linux.
-    Sorts deterministically to pick the canonical primary node.
-    """
+    """Find corresponding /dev/hidrawX character device node on Linux."""
     hidraw_paths = glob.glob(os.path.join(device_path, "hidraw", "hidraw*"))
     if hidraw_paths:
-        node_name = os.path.basename(sorted(hidraw_paths)[0])
+        node_name = os.path.basename(min(hidraw_paths))
         return f"/dev/{node_name}"
     return None
 
@@ -546,7 +1106,7 @@ def _read_device_mac_from_uevent(device_path):
     if not os.path.exists(uevent_file):
         return None
     try:
-        with open(uevent_file, "r", errors="ignore") as f:
+        with open(uevent_file, encoding="utf-8", errors="ignore") as f:
             for line in f:
                 stripped = line.strip()
                 if stripped.startswith("HID_UNIQ="):
@@ -564,7 +1124,7 @@ def _read_device_mac_from_input_uniq(device_path):
     if not uniq_files or not os.path.exists(uniq_files[0]):
         return None
     try:
-        with open(uniq_files[0], "r", errors="ignore") as f:
+        with open(uniq_files[0], encoding="utf-8", errors="ignore") as f:
             content = f.read().strip()
             if content:
                 return content.lower()
@@ -597,10 +1157,7 @@ def _read_device_mac_from_hidraw(devnode):
 
 
 def read_device_mac(device_path):
-    """
-    Read physical Bluetooth Device MAC address of the controller on Linux.
-    Checks sysfs uevent HID_UNIQ, sysfs input*/uniq, and HID Feature Report 0xF2.
-    """
+    """Read physical Bluetooth Device MAC address of the controller on Linux."""
     mac = _read_device_mac_from_uevent(device_path)
     if mac:
         return mac
@@ -618,11 +1175,7 @@ def read_device_mac(device_path):
 
 
 def read_master_mac(devnode):
-    """
-    Read Master Host Bluetooth MAC stored inside PS3 controller memory on Linux.
-    Uses HID Feature Report 0xF5 (similar to sixpair utility).
-    Allocates 64-byte buffer for broad compatibility across clone controllers.
-    """
+    """Read Master Host Bluetooth MAC stored inside PS3 controller memory on Linux."""
     _fcntl = sys.modules.get("fcntl") or fcntl
     if _fcntl is None:
         raise OSError("fcntl module unavailable on this operating system")
@@ -638,11 +1191,7 @@ def read_master_mac(devnode):
 
 
 def write_master_mac(devnode, mac_str):
-    """
-    Write Master Host Bluetooth MAC into PS3 controller EEPROM on Linux.
-    Sends HID Feature Report 0xF5 (subcommand 0x01) via HIDIOCSFEATURE ioctl.
-    Tries 8-byte canonical report first, falling back to 64-byte buffer for clones.
-    """
+    """Write Master Host Bluetooth MAC into PS3 controller EEPROM on Linux."""
     _fcntl = sys.modules.get("fcntl") or fcntl
     if _fcntl is None:
         raise OSError("fcntl module unavailable on this operating system")
@@ -651,11 +1200,11 @@ def write_master_mac(devnode, mac_str):
     mac_bytes = mac_to_bytes(normalized)
     fd = os.open(devnode, os.O_RDWR)
     try:
-        buf8 = bytearray([0xF5, 0x01] + mac_bytes)
+        buf8 = bytearray([0xF5, 0x01, *mac_bytes])
         try:
             _fcntl.ioctl(fd, HIDIOCSFEAT(len(buf8)), buf8)
         except OSError:
-            buf64 = bytearray([0xF5, 0x01] + mac_bytes + [0] * 56)
+            buf64 = bytearray([0xF5, 0x01, *mac_bytes] + [0] * 56)
             _fcntl.ioctl(fd, HIDIOCSFEAT(len(buf64)), buf64)
         return normalized
     finally:
@@ -668,7 +1217,7 @@ def detect_linux_bluetooth_macs(sysfs_root="/sys/class/bluetooth"):
     for addr_path in sorted(glob.glob(os.path.join(sysfs_root, "hci*", "address"))):
         adapter_name = os.path.basename(os.path.dirname(addr_path))
         try:
-            with open(addr_path, "r", errors="ignore") as f:
+            with open(addr_path, encoding="utf-8", errors="ignore") as f:
                 raw_addr = f.read().strip()
             normalized = normalize_mac(raw_addr)
             is_valid, _ = validate_mac(normalized)
@@ -707,7 +1256,7 @@ def load_store(store_path=None):
     if not os.path.exists(path):
         return _default_store()
     try:
-        with open(path, "r", encoding="utf-8") as f:
+        with open(path, encoding="utf-8") as f:
             data = json.load(f)
     except (OSError, json.JSONDecodeError):
         return _default_store()
@@ -724,7 +1273,7 @@ def load_store(store_path=None):
 
 
 def save_store(data, store_path=None):
-    """Persist profile and backup store atomically to disk."""
+    """Persist profile and backup store to disk."""
     path = get_store_path(store_path)
     parent = os.path.dirname(os.path.abspath(path))
     if parent:
@@ -817,10 +1366,8 @@ def record_backup(device_key, previous_master_mac, new_master_mac=None, store_pa
 
     entry["previous_master_mac"] = prev_norm
     if new_master_mac:
-        try:
+        with contextlib.suppress(ValueError):
             entry["last_written_mac"] = normalize_mac(new_master_mac)
-        except ValueError:
-            pass
     entry["updated_at"] = _utc_now_iso()
 
     history = entry.get("history")
@@ -855,25 +1402,46 @@ def get_backup_mac(device_key, store_path=None):
         return None
 
 
+def _resolve_safe_backup_path(filepath):
+    """Canonicalize and validate backup file path within the working directory (S8707)."""
+    if not isinstance(filepath, str) or not filepath.strip():
+        raise ValueError("Backup file path cannot be empty")
+    resolved = os.path.realpath(filepath)
+    base_dir = os.path.realpath(os.getcwd())
+    if resolved == base_dir or not resolved.startswith(base_dir + os.sep):
+        raise ValueError(f"Backup path '{filepath}' is outside the allowed directory")
+    return resolved
+
+
 def export_backup_file(filepath, controllers_data):
     """Export inspected controller MAC state to a standalone JSON backup file."""
+    base_dir = os.path.realpath(os.getcwd())
+    resolved = os.path.realpath(_resolve_safe_backup_path(filepath))
+    if not resolved.startswith(base_dir + os.sep):
+        raise ValueError(f"Backup path '{filepath}' is outside the allowed directory")
+
     payload = {
         "version": 1,
         "exported_at": _utc_now_iso(),
         "controllers": controllers_data,
     }
-    parent = os.path.dirname(os.path.abspath(filepath))
-    if parent:
+    parent = os.path.dirname(resolved)
+    if parent and parent.startswith(base_dir + os.sep):
         os.makedirs(parent, exist_ok=True)
-    with open(filepath, "w", encoding="utf-8") as f:
+    with open(resolved, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2)
         f.write("\n")
-    return filepath
+    return resolved
 
 
 def import_backup_file(filepath):
     """Load controller backup entries from a JSON backup file."""
-    with open(filepath, "r", encoding="utf-8") as f:
+    base_dir = os.path.realpath(os.getcwd())
+    resolved = os.path.realpath(_resolve_safe_backup_path(filepath))
+    if not resolved.startswith(base_dir + os.sep):
+        raise ValueError(f"Backup path '{filepath}' is outside the allowed directory")
+
+    with open(resolved, encoding="utf-8") as f:
         data = json.load(f)
 
     if isinstance(data, dict) and isinstance(data.get("controllers"), list):
@@ -889,7 +1457,7 @@ def import_backup_file(filepath):
 
 
 # ============================================================================
-# High-Level Inspection & Modification
+# High-Level Inspection, Modification & Diagnostics
 # ============================================================================
 
 def safe_input(prompt=""):
@@ -903,7 +1471,7 @@ def safe_input(prompt=""):
 
 
 def format_json(controllers_data):
-    """Format controller inspection or management data as pretty JSON."""
+    """Format controller inspection, diagnostics, or management data as pretty JSON."""
     return json.dumps(controllers_data, indent=2)
 
 
@@ -942,7 +1510,7 @@ def inspect_controller(dev_path, backend=None):
         result["valid"] = is_valid
         result["warning"] = warning
     except PermissionError:
-        result["error"] = "Permission denied (udev rule required or run with sudo / Administrator)"
+        result["error"] = _permission_denied_message(backend.name)
     except Exception as e:
         result["error"] = str(e)
 
@@ -950,15 +1518,10 @@ def inspect_controller(dev_path, backend=None):
 
 
 def change_controller_mac(dev_path, target_mac, backend=None, force=False, store_path=None):
-    """
-    Safely write a new Master MAC to a PS3 controller and verify via read-back.
-    Automatically backs up the previous Master MAC before overwriting.
-    """
-    if backend is None:
-        backend = get_backend()
-
+    """Safely write a new Master MAC to a PS3 controller and verify via read-back."""
+    active_backend = backend if backend is not None else get_backend()
     normalized_mac, write_warning = validate_mac_for_write(target_mac, force=force)
-    inspected = inspect_controller(dev_path, backend=backend)
+    inspected = inspect_controller(dev_path, backend=active_backend)
 
     result = {
         "device_path": dev_path,
@@ -977,7 +1540,6 @@ def change_controller_mac(dev_path, target_mac, backend=None, force=False, store
     if result["error"]:
         return result
 
-    devnode = result["devnode"]
     prev_mac = result["previous_master_mac"]
     if prev_mac and validate_mac(prev_mac)[0]:
         key = _controller_backup_key(result["device_mac"], dev_path)
@@ -986,11 +1548,10 @@ def change_controller_mac(dev_path, target_mac, backend=None, force=False, store
         )
 
     try:
-        backend.write_master_mac(devnode, normalized_mac)
-        readback_mac = backend.read_master_mac(devnode)
+        active_backend.write_master_mac(result["devnode"], normalized_mac)
+        readback_mac = active_backend.read_master_mac(result["devnode"])
         result["master_mac"] = readback_mac
-        is_valid, read_warning = validate_mac(readback_mac)
-        result["valid"] = is_valid
+        result["valid"], read_warning = validate_mac(readback_mac)
         result["verified"] = readback_mac == normalized_mac
         result["warning"] = read_warning or write_warning
         if not result["verified"]:
@@ -998,11 +1559,144 @@ def change_controller_mac(dev_path, target_mac, backend=None, force=False, store
                 f"Write verification mismatch: expected {normalized_mac}, read back {readback_mac}"
             )
     except PermissionError:
-        result["error"] = "Permission denied (udev rule required or run with sudo / Administrator)"
+        result["error"] = _permission_denied_message(active_backend.name)
+    except OSError as e:
+        result["error"] = str(e)
     except Exception as e:
         result["error"] = str(e)
 
     return result
+
+
+def _check_driver_status(backend_name):
+    """Inspect OS-level HID driver/udev readiness for diagnostics."""
+    if backend_name == "linux":
+        rule_paths = [
+            "/etc/udev/rules.d/99-ps3-controller.rules",
+            *glob.glob("/etc/udev/rules.d/*ps3*.rules"),
+            *glob.glob("/lib/udev/rules.d/*ps3*.rules"),
+            *glob.glob("/usr/lib/udev/rules.d/*ps3*.rules"),
+        ]
+        found_rule = next((p for p in rule_paths if os.path.exists(p)), None)
+        return {
+            "ok": found_rule is not None and fcntl is not None,
+            "detail": (
+                f"udev rule present ({found_rule})"
+                if found_rule
+                else "udev rule missing (run ./install.sh or run with sudo)"
+            ),
+        }
+
+    if backend_name == "win32":
+        has_windll = hasattr(ctypes, "windll")
+        return {
+            "ok": has_windll,
+            "detail": "Win32 HID & SetupAPI available" if has_windll else "Win32 DLL loader unavailable",
+        }
+
+    if backend_name == "darwin":
+        has_iokit = os.path.exists(MacOSBackend.IOKIT_PATH) and os.path.exists(MacOSBackend.CF_PATH)
+        return {
+            "ok": has_iokit,
+            "detail": "macOS IOKit & CoreFoundation available" if has_iokit else "macOS IOKit framework missing",
+        }
+
+    return {"ok": False, "detail": f"Unsupported backend: {backend_name}"}
+
+
+def _doctor_tips_for_platform(backend_name):
+    """Return beginner troubleshooting tips tailored to the host OS."""
+    common = [
+        "Use a DATA-capable mini-USB cable (many cheap cables only charge and have no data wires).",
+        "Unplug the USB cable BEFORE pressing the PS button so the controller searches wirelessly.",
+    ]
+    if backend_name == "win32":
+        return [
+            *common,
+            "No Zadig/libusb driver needed: keep the default Windows 'HID-compliant game controller' driver.",
+            "If Steam or DsHidMini/ScpToolkit locks the controller, close them temporarily before writing.",
+        ]
+    if backend_name == "darwin":
+        return [
+            *common,
+            "If access is denied on macOS, allow Terminal in System Settings -> Privacy -> Input Monitoring.",
+        ]
+    return [
+        *common,
+        "On Ubuntu/Fedora/Debian/Arch, run ./install.sh once so udev allows non-root access without sudo.",
+    ]
+
+
+def run_doctor(backend=None, store_path=None):
+    """Run non-destructive environment, driver, Bluetooth, and controller diagnostics."""
+    if backend is None:
+        backend = get_backend()
+
+    devices = backend.detect_devices()
+    controllers = [inspect_controller(d, backend=backend) for d in devices]
+    adapters = backend.detect_host_bluetooth_macs()
+    resolved_store = get_store_path(store_path)
+    store_data = load_store(store_path)
+
+    return {
+        "version": __version__,
+        "platform": sys.platform,
+        "os_release": f"{platform.system()} {platform.release()}",
+        "backend": backend.name,
+        "python_version": platform.python_version(),
+        "python_ok": sys.version_info >= (3, 8),
+        "hid_driver": _check_driver_status(backend.name),
+        "host_bluetooth": adapters,
+        "config_store": {
+            "path": resolved_store,
+            "exists": os.path.exists(resolved_store),
+            "profiles_count": len(store_data.get("profiles", {})),
+            "backups_count": len(store_data.get("backups", {})),
+        },
+        "controllers": controllers,
+        "tips": _doctor_tips_for_platform(backend.name),
+    }
+
+
+def _print_doctor_report(report):
+    """Render beginner-friendly diagnostics output in the terminal."""
+    print("============================================================")
+    print(f"       PS3 MAC MANAGER DIAGNOSTICS (v{report['version']})       ")
+    print("============================================================\n")
+    print(f"Operating System : {report['os_release']} ({report['platform']})")
+    print(f"HID Backend      : {report['backend']}")
+    py_mark = "✓" if report["python_ok"] else "!"
+    print(f"Python Runtime   : [{py_mark}] Python {report['python_version']}")
+    drv = report["hid_driver"]
+    drv_mark = "✓" if drv["ok"] else "!"
+    print(f"USB HID Access   : [{drv_mark}] {drv['detail']}")
+
+    adapters = report["host_bluetooth"]
+    if adapters:
+        adapters_str = ", ".join(f"{a['adapter']} ({a['address']})" for a in adapters)
+        print(f"Host Bluetooth   : [✓] {adapters_str}")
+    else:
+        print("Host Bluetooth   : [i] No active local Bluetooth adapter detected")
+
+    store = report["config_store"]
+    print(
+        f"Config Store     : {store['path']} "
+        f"({store['profiles_count']} profiles, {store['backups_count']} backups)"
+    )
+
+    ctrls = report["controllers"]
+    if ctrls:
+        print(f"\n[✓] Connected Controllers ({len(ctrls)}):")
+        for idx, info in enumerate(ctrls, 1):
+            status = info.get("error") or f"Master={info.get('master_mac')}, Device={info.get('device_mac')}"
+            print(f"  #{idx}: {status}")
+    else:
+        print("\n[i] Connected Controllers: None detected right now")
+
+    print("\nBeginner Checklist:")
+    for tip in report["tips"]:
+        print(f"  - {tip}")
+    print()
 
 
 # ============================================================================
@@ -1012,10 +1706,11 @@ def change_controller_mac(dev_path, target_mac, backend=None, force=False, store
 def parse_args(argv=None):
     """Parse command-line arguments."""
     parser = argparse.ArgumentParser(
-        description="PS3 Controller MAC Address Manager (Read, Write, Pair & Profiles) for Linux & Windows",
+        description="PS3 Controller MAC Address Manager (Windows, macOS & Linux)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""Examples:
   ps3_mac_manager.py                         # Interactive TUI dashboard
+  ps3_mac_manager.py --doctor                # Check system, drivers & cable setup
   ps3_mac_manager.py --check                 # Read-only MAC check
   ps3_mac_manager.py -s 00:1d:0d:4c:e3:78    # Change Master MAC (auto-verifies)
   ps3_mac_manager.py -g                      # Generate & write random safe MAC
@@ -1033,7 +1728,7 @@ def parse_args(argv=None):
     )
     parser.add_argument(
         "-t", "--timeout", type=float, default=None,
-        help="Maximum seconds to wait for controller connection (default: wait indefinitely in interactive mode, 0 in non-interactive)",
+        help="Seconds to wait for controller connection (default: wait indefinitely in TTY, 0 otherwise)",
     )
     parser.add_argument(
         "-a", "--all", action="store_true",
@@ -1042,6 +1737,10 @@ def parse_args(argv=None):
     parser.add_argument(
         "--no-sudo", action="store_true",
         help="Do not attempt automatic sudo re-elevation if permission is denied",
+    )
+    parser.add_argument(
+        "--doctor", action="store_true",
+        help="Run system, driver, Bluetooth, and controller troubleshooting diagnostics",
     )
     parser.add_argument(
         "--check", action="store_true",
@@ -1104,6 +1803,7 @@ def parse_args(argv=None):
 def _has_explicit_action(args):
     """Return True if the caller passed a one-shot CLI action flag."""
     return any([
+        args.doctor,
         args.check,
         args.set_mac is not None,
         args.generate_mac,
@@ -1153,13 +1853,21 @@ def _wait_for_devices(backend, timeout, quiet=False):
     return devices
 
 
-def _reexec_with_sudo(args):
-    """Re-execute current script with sudo using only validated arguments (S8705-safe)."""
-    print("\n[*] Administrator privileges (sudo) required to access controller memory...")
-    script_path = os.path.abspath(__file__)
-    args_list = ["sudo", "--", sys.executable, script_path, "--no-sudo"]
+def _sanitize_sudo_token(raw_val, flag_name):
+    """Validate a CLI string argument for safe sudo re-execution (S8705)."""
+    val = str(raw_val)
+    if not re.match(r"^[A-Za-z0-9_.-]+$", val):
+        print(f"[!] Refusing automatic sudo re-exec: unsupported characters in {flag_name}.")
+        return None
+    return val
 
-    flag_map = [
+
+def _build_sudo_args(args, sudo_bin):
+    """Build sanitized argument list for sudo re-exec, or return None if invalid."""
+    script_path = os.path.abspath(__file__)
+    args_list = [sudo_bin, "--", sys.executable, script_path, "--no-sudo"]
+
+    flag_map = (
         (args.non_interactive, "--non-interactive"),
         (args.all, "--all"),
         (args.check, "--check"),
@@ -1167,47 +1875,75 @@ def _reexec_with_sudo(args):
         (args.pair_host, "--pair-host"),
         (args.clone, "--clone"),
         (args.force, "--force"),
-    ]
-    for enabled, flag in flag_map:
-        if enabled:
-            args_list.append(flag)
+    )
+    args_list.extend(flag for enabled, flag in flag_map if enabled)
 
-    value_map = [
-        (args.set_mac, "--set-mac"),
+    if args.set_mac is not None:
+        try:
+            mac_bytes = mac_to_bytes(args.set_mac)
+        except ValueError as exc:
+            print(f"[!] Invalid MAC address '{args.set_mac}': {exc}")
+            return None
+        safe_mac = ":".join(f"{int(b):02x}" for b in mac_bytes)
+        if not re.match(r"^[0-9a-f:]+$", safe_mac):
+            return None
+        args_list.extend(["--set-mac", safe_mac])
+
+    value_map = (
         (args.adapter, "--adapter"),
         (args.save_profile, "--save-profile"),
         (args.apply_profile, "--apply-profile"),
         (args.backup, "--backup"),
-    ]
-    for val, flag in value_map:
-        if val is not None:
-            args_list.extend([flag, str(val)])
+    )
+    for raw_val, flag in value_map:
+        if raw_val is not None:
+            safe_val = _sanitize_sudo_token(raw_val, flag)
+            if safe_val is None:
+                return None
+            args_list.extend([flag, safe_val])
 
     if args.restore is not None:
         args_list.append("--restore")
         if args.restore != "__AUTO__":
-            args_list.append(str(args.restore))
+            safe_restore = _sanitize_sudo_token(args.restore, "--restore")
+            if safe_restore is None:
+                return None
+            args_list.append(safe_restore)
 
+    return args_list
+
+
+def _reexec_with_sudo(args):
+    """Re-execute current script with sudo using strictly sanitized arguments (S8705-safe)."""
+    sudo_bin = shutil.which("sudo")
+    if not sudo_bin:
+        print("[!] 'sudo' not found. Please run this command as root/administrator.")
+        return 2
+
+    args_list = _build_sudo_args(args, sudo_bin)
+    if args_list is None:
+        return 2
+
+    print("\n[*] Administrator privileges (sudo) required to access controller memory...")
     try:
-        os.execvp("sudo", args_list)
-    except Exception as e:
+        os.execv(sudo_bin, args_list)  # noqa: S606
+    except OSError as e:
         print(f"[!] Failed to re-exec with sudo: {e}")
         return 2
     return 0
 
 
-def _handle_store_only_action(args, store_path=None):
-    """Handle profile management actions that do not require hardware access."""
-    if args.list_profiles:
-        data = load_store(store_path)
-        profiles = list_profiles(store_path)
-        payload = {"profiles": profiles, "backups": data.get("backups", {})}
-        if args.json:
-            print(format_json(payload))
-        else:
-            _print_profiles_and_backups(profiles, data.get("backups", {}))
-        return 0
+def _emit_error(message, as_json=False, exit_code=1):
+    """Print an error message as JSON or plain text and return exit_code."""
+    if as_json:
+        print(format_json({"error": message}))
+    else:
+        print(f"[!] {message}")
+    return exit_code
 
+
+def _handle_profile_delete_or_save(args, store_path):
+    """Handle offline profile delete or offline --save-profile + --set-mac."""
     if args.delete_profile is not None:
         deleted = delete_profile(args.delete_profile, store_path=store_path)
         if args.json:
@@ -1234,13 +1970,26 @@ def _handle_store_only_action(args, store_path=None):
     return None
 
 
-def _emit_error(message, as_json=False, exit_code=1):
-    """Print an error message as JSON or plain text and return exit_code."""
-    if as_json:
-        print(format_json({"error": message}))
-    else:
-        print(f"[!] {message}")
-    return exit_code
+def _handle_store_or_info_action(args, backend, store_path=None):
+    """Handle CLI actions that do not require waiting for a USB controller."""
+    if args.doctor:
+        report = run_doctor(backend=backend, store_path=store_path)
+        if args.json:
+            print(format_json(report))
+        else:
+            _print_doctor_report(report)
+        return 0
+
+    if args.list_profiles:
+        data = load_store(store_path)
+        profiles = list_profiles(store_path)
+        if args.json:
+            print(format_json({"profiles": profiles, "backups": data.get("backups", {})}))
+        else:
+            _print_profiles_and_backups(profiles, data.get("backups", {}))
+        return 0
+
+    return _handle_profile_delete_or_save(args, store_path)
 
 
 def _print_profiles_and_backups(profiles, backups):
@@ -1342,41 +2091,16 @@ def _resolve_restore_target(info, restore_spec, idx, store_path=None):
     raise ValueError(f"No valid master_mac found in backup file '{restore_spec}'")
 
 
-def _execute_cli_action(args, target_devices, backend, store_path=None):
-    """Execute one-shot CLI inspection or modification across target_devices."""
-    if args.set_mac is not None:
-        return [
-            change_controller_mac(d, args.set_mac, backend=backend, force=args.force, store_path=store_path)
-            for d in target_devices
-        ]
+def _execute_write_target(target_devices, target_mac, backend, force, store_path):
+    """Apply target_mac to all target_devices."""
+    return [
+        change_controller_mac(d, target_mac, backend=backend, force=force, store_path=store_path)
+        for d in target_devices
+    ]
 
-    if args.generate_mac:
-        generated_mac = generate_random_mac()
-        return [
-            change_controller_mac(d, generated_mac, backend=backend, force=args.force, store_path=store_path)
-            for d in target_devices
-        ]
 
-    if args.pair_host:
-        adapter = _select_host_adapter(backend, args.adapter)
-        results = []
-        for dev_path in target_devices:
-            res = change_controller_mac(
-                dev_path, adapter["address"], backend=backend, force=args.force, store_path=store_path
-            )
-            res["paired_adapter"] = adapter["adapter"]
-            results.append(res)
-        return results
-
-    if args.apply_profile is not None:
-        profile_mac = get_profile(args.apply_profile, store_path=store_path)
-        if not profile_mac:
-            raise ValueError(f"Profile '{args.apply_profile}' does not exist")
-        return [
-            change_controller_mac(d, profile_mac, backend=backend, force=args.force, store_path=store_path)
-            for d in target_devices
-        ]
-
+def _execute_restore_or_clone(args, target_devices, backend, store_path):
+    """Execute --restore or --clone CLI action."""
     if args.restore is not None:
         results = []
         for idx, dev_path in enumerate(target_devices):
@@ -1390,21 +2114,39 @@ def _execute_cli_action(args, target_devices, backend, store_path=None):
             )
         return results
 
-    if args.clone:
-        inspected = [inspect_controller(d, backend=backend) for d in target_devices]
-        if len(inspected) < 2:
-            raise ValueError("--clone requires at least 2 connected PS3 controllers (use -a/--all)")
-        if inspected[0].get("error") or not inspected[0].get("master_mac"):
-            raise ValueError(f"Cannot read source Master MAC from Controller #1: {inspected[0].get('error')}")
-        source_mac = inspected[0]["master_mac"]
-        results = [inspected[0]]
-        for dev_path in target_devices[1:]:
-            results.append(
-                change_controller_mac(dev_path, source_mac, backend=backend, force=args.force, store_path=store_path)
-            )
+    inspected = [inspect_controller(d, backend=backend) for d in target_devices]
+    if len(inspected) < 2:
+        raise ValueError("--clone requires at least 2 connected PS3 controllers (use -a/--all)")
+    if inspected[0].get("error") or not inspected[0].get("master_mac"):
+        raise ValueError(f"Cannot read source Master MAC from Controller #1: {inspected[0].get('error')}")
+    source_mac = inspected[0]["master_mac"]
+    return [inspected[0], *_execute_write_target(target_devices[1:], source_mac, backend, args.force, store_path)]
+
+
+def _execute_cli_action(args, target_devices, backend, store_path=None):
+    """Execute one-shot CLI inspection or modification across target_devices."""
+    if args.set_mac is not None:
+        return _execute_write_target(target_devices, args.set_mac, backend, args.force, store_path)
+
+    if args.generate_mac:
+        return _execute_write_target(target_devices, generate_random_mac(), backend, args.force, store_path)
+
+    if args.pair_host:
+        adapter = _select_host_adapter(backend, args.adapter)
+        results = _execute_write_target(target_devices, adapter["address"], backend, args.force, store_path)
+        for res in results:
+            res["paired_adapter"] = adapter["adapter"]
         return results
 
-    # Read / Check / Save-Profile-From-Controller / Backup
+    if args.apply_profile is not None:
+        profile_mac = get_profile(args.apply_profile, store_path=store_path)
+        if not profile_mac:
+            raise ValueError(f"Profile '{args.apply_profile}' does not exist")
+        return _execute_write_target(target_devices, profile_mac, backend, args.force, store_path)
+
+    if args.restore is not None or args.clone:
+        return _execute_restore_or_clone(args, target_devices, backend, store_path)
+
     inspected = [inspect_controller(d, backend=backend) for d in target_devices]
     if args.save_profile is not None and inspected and not inspected[0].get("error"):
         saved = save_profile(
@@ -1446,6 +2188,56 @@ def _tui_change_mac(target_devices, backend, store_path):
         _report_tui_write_result(res)
 
 
+def _select_profile_name(names, prompt):
+    """Resolve user-entered 1-based index or profile name."""
+    sel = safe_input(prompt).strip()
+    if sel.isdigit() and 1 <= int(sel) <= len(names):
+        return names[int(sel) - 1]
+    return sel
+
+
+def _tui_profile_save(inspected, store_path):
+    """Save Controller #1 Master MAC to a named profile interactively."""
+    if not inspected or inspected[0].get("error"):
+        print("[!] No readable controller available to save from.")
+        return
+    name = safe_input("Profile name (e.g. robot_a): ").strip()
+    if not name:
+        return
+    try:
+        saved = save_profile(name, inspected[0]["master_mac"], store_path=store_path, force=True)
+        print(f"[✓] Saved profile '{name}' -> {saved}")
+    except ValueError as e:
+        print(f"[!] {e}")
+
+
+def _tui_profile_apply(names, target_devices, backend, store_path):
+    """Apply a saved profile interactively to connected controllers."""
+    if not names:
+        print("[!] No saved profiles available to apply.")
+        return
+    chosen_name = _select_profile_name(names, "Enter profile number or name: ")
+    mac = get_profile(chosen_name, store_path=store_path)
+    if not mac:
+        print(f"[!] Profile '{chosen_name}' not found.")
+        return
+    for dev_path in target_devices:
+        res = change_controller_mac(dev_path, mac, backend=backend, force=True, store_path=store_path)
+        _report_tui_write_result(res)
+
+
+def _tui_profile_delete(names, store_path):
+    """Delete a saved profile interactively."""
+    if not names:
+        print("[!] No saved profiles available to delete.")
+        return
+    chosen_name = _select_profile_name(names, "Profile name or number to delete: ")
+    if delete_profile(chosen_name, store_path=store_path):
+        print(f"[✓] Deleted profile '{chosen_name}'.")
+    else:
+        print(f"[!] Profile '{chosen_name}' not found.")
+
+
 def _tui_profiles_menu(target_devices, inspected, backend, store_path):
     """Interactive submenu for saving, applying, or deleting named MAC profiles."""
     profiles = list_profiles(store_path)
@@ -1464,39 +2256,11 @@ def _tui_profiles_menu(target_devices, inspected, backend, store_path):
 
     choice = safe_input("Profile action: ").strip().lower()
     if choice == "s":
-        if not inspected or inspected[0].get("error"):
-            print("[!] No readable controller available to save from.")
-            return
-        name = safe_input("Profile name (e.g. robot_a): ").strip()
-        if name:
-            try:
-                saved = save_profile(name, inspected[0]["master_mac"], store_path=store_path, force=True)
-                print(f"[✓] Saved profile '{name}' -> {saved}")
-            except ValueError as e:
-                print(f"[!] {e}")
+        _tui_profile_save(inspected, store_path)
     elif choice == "a":
-        if not names:
-            print("[!] No saved profiles available to apply.")
-            return
-        sel = safe_input("Enter profile number or name: ").strip()
-        chosen_name = names[int(sel) - 1] if sel.isdigit() and 1 <= int(sel) <= len(names) else sel
-        mac = get_profile(chosen_name, store_path=store_path)
-        if not mac:
-            print(f"[!] Profile '{chosen_name}' not found.")
-            return
-        for dev_path in target_devices:
-            res = change_controller_mac(dev_path, mac, backend=backend, force=True, store_path=store_path)
-            _report_tui_write_result(res)
+        _tui_profile_apply(names, target_devices, backend, store_path)
     elif choice == "d":
-        if not names:
-            print("[!] No saved profiles available to delete.")
-            return
-        sel = safe_input("Profile name or number to delete: ").strip()
-        chosen_name = names[int(sel) - 1] if sel.isdigit() and 1 <= int(sel) <= len(names) else sel
-        if delete_profile(chosen_name, store_path=store_path):
-            print(f"[✓] Deleted profile '{chosen_name}'.")
-        else:
-            print(f"[!] Profile '{chosen_name}' not found.")
+        _tui_profile_delete(names, store_path)
 
 
 def _tui_generate_mac(target_devices, backend, store_path):
@@ -1530,7 +2294,7 @@ def _tui_pair_host(target_devices, backend, store_path):
         _report_tui_write_result(res)
 
 
-def _tui_restore_backup(target_devices, inspected, backend, store_path):
+def _tui_restore_backup(inspected, backend, store_path):
     """Restore previous Master MAC from automatic backup store."""
     for info in inspected:
         key = _controller_backup_key(info.get("device_mac"), info["device_path"])
@@ -1541,7 +2305,9 @@ def _tui_restore_backup(target_devices, inspected, backend, store_path):
         print(f"[*] Found backup for {key}: {backup_mac}")
         confirm = safe_input(f"Restore Master MAC to {backup_mac}? [Y/n]: ").strip().lower()
         if confirm in ("", "y", "yes"):
-            res = change_controller_mac(info["device_path"], backup_mac, backend=backend, force=True, store_path=store_path)
+            res = change_controller_mac(
+                info["device_path"], backup_mac, backend=backend, force=True, store_path=store_path
+            )
             _report_tui_write_result(res)
 
 
@@ -1559,7 +2325,7 @@ def _run_interactive_tui(target_devices, backend, store_path=None):
     """Interactive menu loop allowing users to inspect, write, pair, profile, or restore."""
     while True:
         devices = backend.detect_devices()
-        active_targets = devices if devices else target_devices
+        active_targets = devices or target_devices
         inspected = [inspect_controller(d, backend=backend) for d in active_targets]
         host_adapters = backend.detect_host_bluetooth_macs()
 
@@ -1578,6 +2344,7 @@ def _run_interactive_tui(target_devices, backend, store_path=None):
         print("  [4] Pair to this PC's Bluetooth adapter (sixpair)")
         print("  [5] Restore previous Master MAC from backup")
         print("  [6] Refresh / Re-scan controller")
+        print("  [7] System diagnostics & troubleshooting (--doctor)")
         print("  [Enter / Q] Exit\n")
 
         choice = safe_input("Select option [Enter to exit]: ").strip().lower()
@@ -1592,9 +2359,11 @@ def _run_interactive_tui(target_devices, backend, store_path=None):
         elif choice == "4":
             _tui_pair_host(active_targets, backend, store_path)
         elif choice == "5":
-            _tui_restore_backup(active_targets, inspected, backend, store_path)
+            _tui_restore_backup(inspected, backend, store_path)
         elif choice == "6":
             continue
+        elif choice == "7":
+            _print_doctor_report(run_doctor(backend=backend, store_path=store_path))
         else:
             print(f"[!] Unknown option: {choice}")
 
@@ -1630,26 +2399,31 @@ def _validate_preconditions(args, backend, store_path):
         import_backup_file(args.restore)
 
 
-def main(argv=None, backend=None, store_path=None):
-    """Main program entry point."""
-    backend = _resolve_backend(backend)
-    args = parse_args(argv)
+def _should_reexec_sudo(args, results):
+    """Determine whether permission errors justify sudo re-elevation on POSIX."""
+    permission_error = any(
+        item.get("error") and "Permission denied" in item["error"] for item in results
+    )
+    return (
+        permission_error
+        and not args.no_sudo
+        and hasattr(os, "geteuid")
+        and os.geteuid() != 0
+        and not args.json
+    )
 
-    store_only_exit = _handle_store_only_action(args, store_path=store_path)
-    if store_only_exit is not None:
-        return store_only_exit
 
-    try:
-        _validate_preconditions(args, backend, store_path)
-    except (ValueError, OSError, json.JSONDecodeError) as e:
-        return _emit_error(str(e), as_json=args.json, exit_code=1)
-
+def _print_banner(args):
+    """Print application header banner for interactive/text runs."""
     if not args.json:
         clear_screen()
         print("============================================================")
         print(f"         PS3 CONTROLLER MAC ADDRESS MANAGER v{__version__}         ")
         print("============================================================\n")
 
+
+def _resolve_initial_devices(args, backend):
+    """Wait for controller connection and handle empty device detection cleanly."""
     timeout = args.timeout
     if timeout is None and (args.non_interactive or not sys.stdin.isatty()):
         timeout = 0.0
@@ -1660,27 +2434,13 @@ def main(argv=None, backend=None, store_path=None):
             print(format_json([]))
         else:
             print(f"\n[!] Timeout ({timeout}s) reached. No PS3 controller detected.")
-        return 1
+            print("    Tip: Run with --doctor to check USB cable, drivers, and permissions.")
+    return devices
 
-    target_devices = devices if args.all or len(devices) > 1 or args.clone else [devices[0]]
 
-    try:
-        results = _execute_cli_action(args, target_devices, backend, store_path=store_path)
-    except (ValueError, OSError, json.JSONDecodeError) as e:
-        return _emit_error(str(e), as_json=args.json, exit_code=1)
-
-    permission_error = any(
-        item.get("error") and "Permission denied" in item["error"] for item in results
-    )
-    if (
-        permission_error
-        and not args.no_sudo
-        and hasattr(os, "geteuid")
-        and os.geteuid() != 0
-        and not args.json
-    ):
-        return _reexec_with_sudo(args)
-
+def _finalize_cli_output(args, results, device_state, backend, store_path):
+    """Render CLI output and launch interactive TUI or exit cleanly."""
+    devices, target_devices = device_state
     if args.json:
         print(format_json(results))
         return 1 if any(item.get("error") for item in results) else 0
@@ -1710,6 +2470,38 @@ def main(argv=None, backend=None, store_path=None):
         safe_input("Done! Press [Enter] to close terminal...")
 
     return 1 if has_errors else 0
+
+
+def main(argv=None, backend=None, store_path=None):
+    """Main program entry point."""
+    backend = _resolve_backend(backend)
+    args = parse_args(argv)
+
+    early_exit = _handle_store_or_info_action(args, backend, store_path=store_path)
+    if early_exit is not None:
+        return early_exit
+
+    try:
+        _validate_preconditions(args, backend, store_path)
+    except (ValueError, OSError, json.JSONDecodeError) as e:
+        return _emit_error(str(e), as_json=args.json, exit_code=1)
+
+    _print_banner(args)
+    devices = _resolve_initial_devices(args, backend)
+    if not devices:
+        return 1
+
+    target_devices = devices if args.all or len(devices) > 1 or args.clone else [devices[0]]
+
+    try:
+        results = _execute_cli_action(args, target_devices, backend, store_path=store_path)
+    except (ValueError, OSError, json.JSONDecodeError) as e:
+        return _emit_error(str(e), as_json=args.json, exit_code=1)
+
+    if _should_reexec_sudo(args, results):
+        return _reexec_with_sudo(args)
+
+    return _finalize_cli_output(args, results, (devices, target_devices), backend, store_path)
 
 
 if __name__ == "__main__":
