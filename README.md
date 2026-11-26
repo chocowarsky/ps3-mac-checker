@@ -180,6 +180,21 @@ Actions:
 
 ---
 
+## AI Agent Harness Support
+
+`ps3-mac-manager` ships native instructions and manifests for every major AI agent harness (**Antigravity, Claude Code, Codex, Cursor, Windsurf, VS Code / Copilot, OpenCode, Cline, Roo Code**):
+
+```bash
+# Install as an Agent Skill via skills.sh CLI
+npx skills add chocowarsky/ps3-mac-manager
+```
+
+- **100% offline & zero API keys required.** Local profiles/backups live in `~/.config/ps3-mac-manager/config.json`.
+- **Non-interactive agent rule:** Always pass `-j -n --no-sudo` (`python3 ps3_mac_manager.py --doctor --json`, `--check -j -n -t 0 --no-sudo`).
+- See [`AGENTS.md`](AGENTS.md) and [`skills/ps3-mac-manager/SKILL.md`](skills/ps3-mac-manager/SKILL.md) for full agent instructions.
+
+---
+
 ## License
 
 MIT License. See [LICENSE](LICENSE) for details.

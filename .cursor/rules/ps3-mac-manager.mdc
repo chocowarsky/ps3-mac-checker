@@ -1,0 +1,13 @@
+---
+description: Offline cross-platform CLI & TUI to inspect, reprogram, pair, and manage PS3 DualShock 3 / Sixaxis Bluetooth MAC addresses over USB.
+alwaysApply: false
+---
+
+# ps3-mac-manager — Cursor Agent Rule
+
+Read `AGENTS.md` and `skills/ps3-mac-manager/SKILL.md`.
+
+1. Always invoke non-interactively with `-j -n --no-sudo` (`python3 ps3_mac_manager.py --doctor --json`, `--check -j -n -t 0 --no-sudo`).
+2. Zero API keys or external packages are required (100% offline Python 3.8+ stdlib).
+3. Never write a Master MAC (`-s`, `-g`, `-p`, `--apply-profile`, `--clone`, `--restore`) without explicit user confirmation.
+4. Keep `ps3_mac_manager.py` zero-dependency and verify changes with `python3 -m unittest discover -s tests -v`.

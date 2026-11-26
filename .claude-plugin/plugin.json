@@ -1,0 +1,12 @@
+{
+  "name": "ps3-mac-manager",
+  "version": "2.0.0",
+  "description": "Zero-dependency, 100% offline cross-platform CLI & TUI to read, change, pair, clone, and manage Sony PS3 (DualShock 3 / Sixaxis) Bluetooth MAC addresses over USB.",
+  "author": {
+    "name": "chocowarsky",
+    "url": "https://github.com/chocowarsky"
+  },
+  "repository": "https://github.com/chocowarsky/ps3-mac-manager",
+  "license": "MIT",
+  "keywords": ["ps3", "dualshock3", "sixaxis", "bluetooth", "mac-address", "esp32", "arduino", "hid", "agent-skill"]
+}

@@ -1,0 +1,15 @@
+{
+  "name": "ps3-mac-manager",
+  "displayName": "PS3 MAC Manager",
+  "version": "2.0.0",
+  "description": "Zero-dependency, 100% offline cross-platform tool (Windows, macOS, Linux) to read, change, pair, clone, and manage Sony PS3 controller Master & Device Bluetooth MAC addresses over USB.",
+  "author": {
+    "name": "chocowarsky"
+  },
+  "repository": "https://github.com/chocowarsky/ps3-mac-manager",
+  "suggestedPrompts": [
+    "Run ps3-mac-manager --doctor to check USB HID drivers and connected PS3 controllers",
+    "Read the Master MAC address from my connected PS3 controller for ESP32 Ps3.begin()",
+    "Save a named robot MAC profile offline in ps3-mac-manager"
+  ]
+}

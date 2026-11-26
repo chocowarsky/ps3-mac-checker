@@ -1,0 +1,28 @@
+{
+  "name": "ps3-mac-manager-marketplace",
+  "owner": {
+    "name": "chocowarsky",
+    "url": "https://github.com/chocowarsky"
+  },
+  "metadata": {
+    "description": "Zero-dependency, 100% offline cross-platform PS3 controller Bluetooth MAC address manager and universal agent skill.",
+    "version": "2.0.0"
+  },
+  "plugins": [
+    {
+      "name": "ps3-mac-manager",
+      "source": "./",
+      "description": "Read, change, pair (sixpair), clone, back up, and manage PS3 DualShock 3 / Sixaxis Master & Device MAC addresses over USB on Windows, macOS, and Linux.",
+      "version": "2.0.0",
+      "author": {
+        "name": "chocowarsky"
+      },
+      "homepage": "https://github.com/chocowarsky/ps3-mac-manager",
+      "repository": "https://github.com/chocowarsky/ps3-mac-manager",
+      "license": "MIT",
+      "keywords": ["ps3", "dualshock3", "esp32", "bluetooth", "mac-address", "hid"],
+      "category": "hardware",
+      "skills": ["./skills/ps3-mac-manager"]
+    }
+  ]
+}
